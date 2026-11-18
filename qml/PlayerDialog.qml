@@ -27,6 +27,7 @@ Dialog {
         latencySpin.value = c.latency !== undefined ? c.latency : 200
         decoderBox.currentIndex = c.decoder !== undefined ? c.decoder : 0
         lowLatencyCheck.checked = c.lowLatency !== undefined ? c.lowLatency : true
+        snapshotSpin.value = c.snapshotInterval !== undefined ? c.snapshotInterval : 1000
         open()
         urlField.forceActiveFocus()
         urlField.selectAll()
@@ -41,7 +42,8 @@ Dialog {
             transport: transportBox.currentIndex,
             latency: latencySpin.value,
             decoder: decoderBox.currentIndex,
-            lowLatency: lowLatencyCheck.checked
+            lowLatency: lowLatencyCheck.checked,
+            snapshotInterval: snapshotSpin.value
         }
         if (player)
             player.applyConfig(cfg)
@@ -50,7 +52,26 @@ Dialog {
         close()
     }
 
-    readonly property bool urlValid: /^(rtsps?|rtsp[tuh]|https?|test|file):\/\/.+/i.test(urlField.text.trim())
+    readonly property string url_: urlField.text.trim()
+    readonly property bool urlValid: /^(rtsps?|rtsp[tuh]|https?|wss?|m4[sf]s?|test|file):\/\/.+/i.test(url_)
+    readonly property bool isRtsp: /^rtsp/i.test(url_)
+    readonly property bool isSnapshot: /^https?:\/\/[^?#]+\.jpe?g([?#].*)?$/i.test(url_)
+    // Protocol shown next to the address field.
+    readonly property string protocol: {
+        const u = url_.toLowerCase().split(/[?#]/)[0]
+        if (/^rtsp/.test(u)) return "RTSP"
+        if (/^m4s/.test(u)) return "M4S → MSE-LD"
+        if (/^m4f/.test(u)) return "M4F → MPEG-TS"
+        if (/^wss?:/.test(u)) return "MSE-LD (WebSocket)"
+        if (isSnapshot) return "JPEG-снимки"
+        if (/\.m3u8$/.test(u)) return "HLS"
+        if (/\.mpd$/.test(u)) return "DASH"
+        if (/\.ism/.test(u)) return "MSS"
+        if (/mpegts$|\.ts$/.test(u)) return "MPEG-TS по HTTP"
+        if (/^https?:/.test(u)) return "HTTP (автоопределение)"
+        if (/^test:/.test(u)) return "тестовый сигнал"
+        return ""
+    }
 
     contentItem: GridLayout {
         columns: 2
@@ -78,7 +99,10 @@ Dialog {
             wrapMode: Text.Wrap
             opacity: 0.65
             font.pixelSize: 11
-            text: "RTSP: H.264, H.265, MJPEG. Также http(s):// — MJPEG по HTTP, test://ball — тестовый сигнал."
+            text: (dlg.protocol ? "Протокол: <b>" + dlg.protocol + "</b><br>" : "")
+                  + "RTSP; HLS (.m3u8), DASH (.mpd), MSS (.isml/manifest), MPEG-TS и MJPEG по HTTP; "
+                  + "JPEG-снимки (.jpg); MSE-LD (ws://…/mse_ld); m4s:// и m4f:// Flussonic; test://ball."
+            textFormat: Text.StyledText
         }
 
         Label { text: "Логин" }
@@ -99,15 +123,25 @@ Dialog {
             }
         }
 
-        Label { text: "Транспорт RTSP" }
+        Label { text: "Транспорт RTSP"; visible: dlg.isRtsp }
         ComboBox {
             id: transportBox
+            visible: dlg.isRtsp
             Layout.fillWidth: true
             model: ["Авто (UDP, при неудаче TCP)", "TCP (надёжно через NAT/VPN)", "UDP (минимальная задержка)"]
         }
 
-        Label { text: "Буфер, мс" }
+        Label { text: "Обновление снимка, мс"; visible: dlg.isSnapshot }
+        SpinBox {
+            id: snapshotSpin
+            visible: dlg.isSnapshot
+            from: 100; to: 60000; stepSize: 100
+            editable: true
+        }
+
+        Label { text: "Буфер, мс"; visible: dlg.isRtsp }
         RowLayout {
+            visible: dlg.isRtsp
             SpinBox {
                 id: latencySpin
                 from: 0; to: 5000; stepSize: 50

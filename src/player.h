@@ -19,6 +19,9 @@
 
 class QQuickItem;
 class QVideoSink;
+class QNetworkAccessManager;
+class QNetworkReply;
+class QWebSocket;
 struct PipelineCtx;
 
 class Player : public QObject
@@ -33,6 +36,8 @@ class Player : public QObject
     Q_PROPERTY(int latency READ latency NOTIFY configChanged)
     Q_PROPERTY(int decoder READ decoder NOTIFY configChanged)
     Q_PROPERTY(bool lowLatency READ lowLatency NOTIFY configChanged)
+    Q_PROPERTY(int snapshotInterval READ snapshotInterval NOTIFY configChanged)
+    Q_PROPERTY(QString sourceType READ sourceType NOTIFY configChanged)
     Q_PROPERTY(bool active READ active NOTIFY activeChanged)
     Q_PROPERTY(qint64 created READ created CONSTANT)
     // --- geometry ---
@@ -84,6 +89,14 @@ public:
     int latency() const { return m_latency; }
     int decoder() const { return m_decoder; }
     bool lowLatency() const { return m_lowLatency; }
+    int snapshotInterval() const { return m_snapshotInterval; }
+    QString sourceType() const;     // human readable protocol name
+
+    // Kind of source, derived from the URL.
+    enum class Source { Rtsp, HttpStream, Snapshot, MseLd, Test, Other };
+    // Resolves aliases (m4s://, m4f://) and classifies the URL.
+    static QUrl resolveUrl(const QString &url, Source *kind);
+    static bool webSocketsAvailable();
     bool active() const { return m_active; }
     qint64 created() const { return m_created; }
 
@@ -165,6 +178,13 @@ private:
     void onFirstFrame(quint64 gen);
 
     GstElement *buildTail(PipelineCtx *ctx, QString *error);
+    GstElement *makeAppSrc(const char *caps, bool doTimestamp);
+    void pushToAppSrc(const QByteArray &data);
+    void stopNetworkSources();
+    void requestSnapshot();
+    void startMseLd(const QUrl &url);
+    void onMseText(quint64 gen, const QString &msg);
+    void onMseBinary(quint64 gen, const QByteArray &data);
 
     // configuration
     QString m_uid;
@@ -176,6 +196,7 @@ private:
     int m_latency = 200;
     int m_decoder = DecoderAuto;
     bool m_lowLatency = true;
+    int m_snapshotInterval = 1000;   // ms, JPEG snapshot polling
     bool m_active = true;
     qint64 m_created = 0;
     qreal m_displayWidth = 480;
@@ -210,6 +231,15 @@ private:
     PipelineCtx *m_ctx = nullptr;
     quint64 m_gen = 0;
     int m_teardowns = 0;         // asynchronous teardowns still running
+    int m_stallLimit = 10;       // seconds without frames before reconnect
+    GstElement *m_appsrc = nullptr;   // snapshot / MSE-LD input (owned by the pipeline)
+    QUrl m_sourceUrl;                 // resolved URL of the running pipeline
+    QNetworkAccessManager *m_nam = nullptr;
+    QPointer<QNetworkReply> m_snapReply;
+    QTimer m_snapshotTimer;
+    QWebSocket *m_ws = nullptr;
+    int m_mseTrack = -1;              // MSE-LD: id of the video track
+    bool m_mseInit = false;
     bool m_startPending = false;
     QTimer m_retryTimer;
     QTimer m_watchdog;

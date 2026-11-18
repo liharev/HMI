@@ -10,7 +10,7 @@ SUDO=""
 
 PKGS=(
   build-essential cmake ninja-build pkg-config
-  qt6-base-dev qt6-declarative-dev qt6-multimedia-dev
+  qt6-base-dev qt6-declarative-dev qt6-multimedia-dev qt6-websockets-dev
   qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts
   qml6-module-qtquick-window qml6-module-qtquick-dialogs qml6-module-qtquick-templates
   qml6-module-qtqml-workerscript qml6-module-qtmultimedia

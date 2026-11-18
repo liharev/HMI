@@ -15,7 +15,17 @@
 #include <QVideoFrameFormat>
 #include <QVideoSink>
 
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#ifdef HMI_HAVE_WEBSOCKETS
+#include <QWebSocket>
+#endif
+
 #include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
 #include <gst/video/video.h>
 
 #include <atomic>
@@ -41,6 +51,10 @@ struct PipelineCtx
     gsu::DecoderPref pref = gsu::DecoderPref::Auto;
     bool glSink = false;
     bool convert = false;          // compatibility: CPU colour conversion
+    bool adaptive = false;         // HLS / DASH / MSS manifest (not a live byte stream)
+    bool forceSync = false;        // segment based: frames must be paced by the clock
+    QString username;
+    QString password;
     GstElement *pipeline = nullptr;
     GstElement *tail = nullptr;
     std::atomic<bool> linked{false};
@@ -297,6 +311,15 @@ struct PipelineCallbacks
         // JPEG parser is optional, H.264/H.265 parsers are required.
         if (!append(parse, codec == gsu::Codec::Jpeg))
             return fail(QStringLiteral("Нет элемента %1 (gst-plugins-bad)").arg(parse));
+        if (codec == gsu::Codec::Jpeg && append("queue", true) && !chain.isEmpty()) {
+            // Every JPEG is a key frame: if decoding falls behind, drop old
+            // compressed frames instead of accumulating delay.
+            GstElement *q = chain.last();
+            gsu::setArg(q, "max-size-buffers", QStringLiteral("2"));
+            gsu::setArg(q, "max-size-bytes", QStringLiteral("0"));
+            gsu::setArg(q, "max-size-time", QStringLiteral("0"));
+            gsu::setArg(q, "leaky", QStringLiteral("downstream"));
+        }
 
         GstElement *decoder = nullptr;
         QString decoderFactory;
@@ -380,20 +403,85 @@ struct PipelineCallbacks
         linkDecodeChain(ctx, pad, codec, true);
     }
 
-    static void multipartPadAdded(GstElement *, GstPad *pad, gpointer data)
+    // Streams we do not show (audio, metadata, extra video) go to a fakesink,
+    // otherwise demuxers stop with "not-linked".
+    static void linkFakeSink(PipelineCtx *ctx, GstPad *pad)
+    {
+        GstElement *sink = make("fakesink");
+        if (!sink)
+            return;
+        gsu::setArg(sink, "sync", QStringLiteral("false"));
+        gsu::setArg(sink, "async", QStringLiteral("false"));
+        gst_bin_add(GST_BIN(ctx->pipeline), sink);
+        gst_element_sync_state_with_parent(sink);
+        GstPad *sp = gst_element_get_static_pad(sink, "sink");
+        gst_pad_link(pad, sp);
+        gst_object_unref(sp);
+    }
+
+    // Pads with parsed elementary streams: urisourcebin(parse-streams),
+    // parsebin, qtdemux (MSE-LD). Decoder is chosen by us (HW first).
+    static void parsedPadAdded(GstElement *, GstPad *pad, gpointer data)
     {
         auto *ctx = static_cast<PipelineCtx *>(data);
         GstCaps *caps = gst_pad_get_current_caps(pad);
         if (!caps)
             caps = gst_pad_query_caps(pad, nullptr);
-        const bool jpeg = gst_structure_has_name(gst_caps_get_structure(caps, 0), "image/jpeg");
+        const bool fixed = caps && !gst_caps_is_any(caps) && !gst_caps_is_empty(caps) && gst_caps_is_fixed(caps);
+        if (!fixed) {
+            // Adaptive streams (HLS/DASH/MSS) expose pads before the stream
+            // type is known: decide when the caps arrive.
+            if (caps)
+                gst_caps_unref(caps);
+            g_signal_connect(pad, "notify::caps", G_CALLBACK(&PipelineCallbacks::padCapsKnown), data);
+            return;
+        }
+        const QString name = QString::fromUtf8(gst_structure_get_name(gst_caps_get_structure(caps, 0)));
         gst_caps_unref(caps);
-        if (!jpeg)
-            return;
+        gsu::Codec codec = gsu::Codec::Unknown;
+        if (name == QLatin1String("video/x-h264"))
+            codec = gsu::Codec::H264;
+        else if (name == QLatin1String("video/x-h265"))
+            codec = gsu::Codec::H265;
+        else if (name == QLatin1String("image/jpeg"))
+            codec = gsu::Codec::Jpeg;
+        const bool video = codec != gsu::Codec::Unknown || name.startsWith(QLatin1String("video/"));
         bool expected = false;
-        if (!ctx->linked.compare_exchange_strong(expected, true))
+        if (!video || !ctx->linked.compare_exchange_strong(expected, true)) {
+            linkFakeSink(ctx, pad);
             return;
-        linkDecodeChain(ctx, pad, gsu::Codec::Jpeg, false);
+        }
+        if (codec == gsu::Codec::Unknown) {
+            linkFakeSink(ctx, pad);
+            ctx->postError(QStringLiteral("Неподдерживаемый кодек: %1").arg(name));
+            return;
+        }
+        linkDecodeChain(ctx, pad, codec, false);
+    }
+
+    static void padCapsKnown(GstPad *pad, GParamSpec *, gpointer data)
+    {
+        GstCaps *caps = gst_pad_get_current_caps(pad);
+        if (!caps)
+            return;
+        gst_caps_unref(caps);
+        g_signal_handlers_disconnect_by_func(pad, gpointer(&PipelineCallbacks::padCapsKnown), data);
+        parsedPadAdded(nullptr, pad, data);
+    }
+
+    // urisourcebin: credentials and live flags for the HTTP source.
+    static void sourceSetup(GstElement *, GstElement *source, gpointer data)
+    {
+        auto *ctx = static_cast<PipelineCtx *>(data);
+        if (!ctx->username.isEmpty()) {
+            gsu::setArg(source, "user-id", ctx->username);
+            gsu::setArg(source, "user-pw", ctx->password);
+        }
+        if (!ctx->adaptive) {
+            // Endless live byte stream (MPEG-TS, multipart MJPEG).
+            gsu::setArg(source, "is-live", QStringLiteral("true"));
+            gsu::setArg(source, "do-timestamp", QStringLiteral("true"));
+        }
     }
 
     static void uriPadAdded(GstElement *, GstPad *pad, gpointer data)
@@ -434,6 +522,8 @@ Player::Player(QObject *parent)
     connect(&m_retryTimer, &QTimer::timeout, this, &Player::ensureRunning);
     m_watchdog.setInterval(1000);
     connect(&m_watchdog, &QTimer::timeout, this, &Player::onWatchdog);
+    m_snapshotTimer.setSingleShot(true);
+    connect(&m_snapshotTimer, &QTimer::timeout, this, &Player::requestSnapshot);
 }
 
 Player::~Player()
@@ -455,6 +545,7 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     p->m_latency = o.value(QLatin1String("latency")).toInt(200);
     p->m_decoder = o.value(QLatin1String("decoder")).toInt(DecoderAuto);
     p->m_lowLatency = o.value(QLatin1String("lowLatency")).toBool(true);
+    p->m_snapshotInterval = qBound(100, o.value(QLatin1String("snapshotInterval")).toInt(1000), 3600000);
     p->m_active = o.value(QLatin1String("active")).toBool(true);
     p->m_created = qint64(o.value(QLatin1String("created")).toDouble(double(p->m_created)));
     p->m_displayWidth = qBound(kMinWidth, o.value(QLatin1String("width")).toDouble(480), kMaxWidth);
@@ -479,6 +570,7 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("latency"), m_latency);
     o.insert(QLatin1String("decoder"), m_decoder);
     o.insert(QLatin1String("lowLatency"), m_lowLatency);
+    o.insert(QLatin1String("snapshotInterval"), m_snapshotInterval);
     o.insert(QLatin1String("active"), m_active);
     o.insert(QLatin1String("created"), double(m_created));
     o.insert(QLatin1String("width"), m_displayWidth);
@@ -564,6 +656,7 @@ QVariantMap Player::config() const
         {QStringLiteral("latency"), m_latency},
         {QStringLiteral("decoder"), m_decoder},
         {QStringLiteral("lowLatency"), m_lowLatency},
+        {QStringLiteral("snapshotInterval"), m_snapshotInterval},
     };
 }
 
@@ -576,6 +669,7 @@ void Player::applyConfig(const QVariantMap &c)
     const int latency = qBound(0, c.value(QStringLiteral("latency"), m_latency).toInt(), 10000);
     const int decoder = c.value(QStringLiteral("decoder"), m_decoder).toInt();
     const bool lowLatency = c.value(QStringLiteral("lowLatency"), m_lowLatency).toBool();
+    m_snapshotInterval = qBound(100, c.value(QStringLiteral("snapshotInterval"), m_snapshotInterval).toInt(), 3600000);
 
     const bool streamChanged = url != m_url || user != m_username || pass != m_password
                                || transport != m_transport || latency != m_latency
@@ -714,7 +808,7 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
     gsu::setArg(queue, "max-size-bytes", QStringLiteral("0"));
     gsu::setArg(queue, "max-size-time", QStringLiteral("0"));
     gsu::setArg(queue, "leaky", QStringLiteral("downstream"));
-    const QString sync = m_lowLatency ? QStringLiteral("false") : QStringLiteral("true");
+    const QString sync = (m_lowLatency && !ctx->forceSync) ? QStringLiteral("false") : QStringLiteral("true");
 
     QList<GstElement *> elems{queue};
     if (ctx->glSink && ctx->convert) {
@@ -819,6 +913,18 @@ void Player::startPipeline()
         scheduleRetry(msg);
     };
 
+    Source kind = Source::Other;
+    const QUrl url = resolveUrl(m_url, &kind);
+    if (kind == Source::HttpStream) {
+        const QString path = url.path().toLower();
+        ctx->adaptive = path.endsWith(QLatin1String(".m3u8")) || path.endsWith(QLatin1String(".mpd"))
+                        || path.contains(QLatin1String(".isml")) || path.contains(QLatin1String(".ism/"))
+                        || path.endsWith(QLatin1String("/manifest"));
+        // HLS/DASH/MSS deliver whole segments at once: without clock sync a
+        // segment would be shown in a burst followed by a freeze.
+        ctx->forceSync = ctx->adaptive;
+    }
+
     QString err;
     GstElement *tail = buildTail(ctx, &err);
     if (!tail)
@@ -826,13 +932,17 @@ void Player::startPipeline()
     gst_bin_add(GST_BIN(pipe), tail);
     ctx->tail = tail;
 
-    QUrl url = QUrl::fromUserInput(m_url);
-    const QString scheme = url.scheme().toLower();
-    if (scheme.startsWith(QLatin1String("rtsp"))) {
+    m_sourceUrl = url;
+    m_stallLimit = 10;
+    ctx->username = m_username;
+    ctx->password = m_password;
+
+    switch (kind) {
+    case Source::Rtsp: {
         GstElement *src = make("rtspsrc");
         if (!src)
             return abort(QStringLiteral("Нет элемента rtspsrc (gstreamer1.0-plugins-good)"));
-        gsu::setArg(src, "location", m_url);
+        gsu::setArg(src, "location", url.toString(QUrl::FullyEncoded));
         gsu::setArg(src, "latency", QString::number(m_latency));
         gsu::setArg(src, "drop-on-latency", QStringLiteral("true"));
         gsu::setArg(src, "do-retransmission", QStringLiteral("false"));
@@ -848,26 +958,78 @@ void Player::startPipeline()
             g_signal_connect(src, "select-stream", G_CALLBACK(&PipelineCallbacks::rtspSelectStream), ctx);
         g_signal_connect(src, "pad-added", G_CALLBACK(&PipelineCallbacks::rtspPadAdded), ctx);
         gst_bin_add(GST_BIN(pipe), src);
-    } else if (scheme == QLatin1String("http") || scheme == QLatin1String("https")) {
-        // MJPEG over HTTP (multipart/x-mixed-replace), common on IP cameras.
-        GstElement *src = make("souphttpsrc");
-        GstElement *demux = make("multipartdemux");
-        if (!src || !demux) {
-            if (src) gst_object_unref(src);
+        break;
+    }
+    case Source::HttpStream: {
+        // HLS, DASH, MSS, HTTP MPEG-TS, multipart MJPEG, fMP4 over HTTP.
+        // The container is detected from the content; urisourcebin with
+        // parse-streams (GStreamer >= 1.22) also drives the adaptive demuxers.
+        const QString uri = url.toString(QUrl::FullyEncoded);
+        GstElement *src = make("urisourcebin");
+        if (src && gsu::hasProperty(src, "parse-streams")) {
+            gsu::setArg(src, "uri", uri);
+            gsu::setArg(src, "parse-streams", QStringLiteral("true"));
+            g_signal_connect(src, "source-setup", G_CALLBACK(&PipelineCallbacks::sourceSetup), ctx);
+            g_signal_connect(src, "pad-added", G_CALLBACK(&PipelineCallbacks::parsedPadAdded), ctx);
+            gst_bin_add(GST_BIN(pipe), src);
+        } else {
+            if (src)
+                gst_object_unref(src);
+            GstElement *http = make("souphttpsrc");
+            GstElement *parse = make("parsebin");
+            if (!http || !parse) {
+                if (http) gst_object_unref(http);
+                if (parse) gst_object_unref(parse);
+                return abort(QStringLiteral("Нет souphttpsrc/parsebin (gstreamer1.0-plugins-good/base)"));
+            }
+            gsu::setArg(http, "location", uri);
+            PipelineCallbacks::sourceSetup(nullptr, http, ctx);
+            gst_bin_add_many(GST_BIN(pipe), http, parse, nullptr);
+            gst_element_link(http, parse);
+            g_signal_connect(parse, "pad-added", G_CALLBACK(&PipelineCallbacks::parsedPadAdded), ctx);
+        }
+        if (ctx->adaptive)
+            m_stallLimit = 20;     // segments arrive in bursts
+        break;
+    }
+    case Source::Snapshot: {
+        // JPEG snapshots (e.g. Flussonic preview.jpg) polled over HTTP and fed
+        // into a persistent pipeline: no flicker between images.
+        m_appsrc = makeAppSrc("image/jpeg", true);
+        if (!m_appsrc)
+            return abort(QStringLiteral("Нет элемента appsrc"));
+        gst_bin_add(GST_BIN(pipe), m_appsrc);
+        GstPad *pad = gst_element_get_static_pad(m_appsrc, "src");
+        ctx->linked = true;
+        const bool ok = PipelineCallbacks::linkDecodeChain(ctx, pad, gsu::Codec::Jpeg, false);
+        gst_object_unref(pad);
+        if (!ok) {
+            m_appsrc = nullptr;
+            return abort(QStringLiteral("Не найден декодер JPEG"));
+        }
+        m_stallLimit = qMax(10, 2 * m_snapshotInterval / 1000 + 5);
+        break;
+    }
+    case Source::MseLd: {
+#ifdef HMI_HAVE_WEBSOCKETS
+        // Flussonic MSE-LD: fragmented MP4 over WebSocket -> qtdemux.
+        m_appsrc = makeAppSrc("video/quicktime", false);
+        GstElement *demux = make("qtdemux");
+        if (!m_appsrc || !demux) {
+            if (m_appsrc) gst_object_unref(m_appsrc);
             if (demux) gst_object_unref(demux);
-            return abort(QStringLiteral("Нет souphttpsrc/multipartdemux (gstreamer1.0-plugins-good)"));
+            m_appsrc = nullptr;
+            return abort(QStringLiteral("Нет appsrc/qtdemux (gstreamer1.0-plugins-good)"));
         }
-        gsu::setArg(src, "location", m_url);
-        gsu::setArg(src, "is-live", QStringLiteral("true"));
-        gsu::setArg(src, "do-timestamp", QStringLiteral("true"));
-        if (!m_username.isEmpty()) {
-            gsu::setArg(src, "user-id", m_username);
-            gsu::setArg(src, "user-pw", m_password);
-        }
-        gst_bin_add_many(GST_BIN(pipe), src, demux, nullptr);
-        gst_element_link(src, demux);
-        g_signal_connect(demux, "pad-added", G_CALLBACK(&PipelineCallbacks::multipartPadAdded), ctx);
-    } else if (scheme == QLatin1String("test")) {
+        gst_bin_add_many(GST_BIN(pipe), m_appsrc, demux, nullptr);
+        gst_element_link(m_appsrc, demux);
+        g_signal_connect(demux, "pad-added", G_CALLBACK(&PipelineCallbacks::parsedPadAdded), ctx);
+        break;
+#else
+        return abort(QStringLiteral("Программа собрана без Qt WebSockets (установите qt6-websockets-dev и пересоберите)"));
+#endif
+    }
+    case Source::Test: {
         // test://smpte?w=1280&h=720&fps=25  - synthetic source for diagnostics
         const QUrlQuery q(url);
         auto qi = [&](const char *k, int def) {
@@ -893,7 +1055,9 @@ void Player::startPipeline()
         m_codec = QStringLiteral("RAW");
         m_decoderName = QStringLiteral("videotestsrc");
         Q_EMIT videoInfoChanged();
-    } else {
+        break;
+    }
+    case Source::Other: {
         // Files and anything else GStreamer can open (uses auto-plugged decoders).
         GstElement *src = make("uridecodebin");
         if (!src)
@@ -901,6 +1065,8 @@ void Player::startPipeline()
         gsu::setArg(src, "uri", url.toString(QUrl::FullyEncoded));
         g_signal_connect(src, "pad-added", G_CALLBACK(&PipelineCallbacks::uriPadAdded), ctx);
         gst_bin_add(GST_BIN(pipe), src);
+        break;
+    }
     }
 
     GstBus *bus = gst_element_get_bus(pipe);
@@ -917,13 +1083,249 @@ void Player::startPipeline()
               m_status == Reconnecting ? m_statusText : QString());
     m_watchdog.start();
 
-    if (gst_element_set_state(pipe, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+    if (gst_element_set_state(pipe, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         scheduleRetry(QStringLiteral("Не удалось запустить воспроизведение"));
+        return;
+    }
+    if (kind == Source::Snapshot)
+        requestSnapshot();
+    else if (kind == Source::MseLd)
+        startMseLd(url);
+}
+
+// ---------------------------------------------------------------------------
+// URL handling and network-fed sources (snapshots, MSE-LD)
+// ---------------------------------------------------------------------------
+QUrl Player::resolveUrl(const QString &text, Source *kind)
+{
+    QUrl url = QUrl::fromUserInput(text.trimmed());
+    QString scheme = url.scheme().toLower();
+    // Flussonic server-to-server protocols are not available to players;
+    // the same stream is taken from the equivalent public output:
+    //   m4s://host/stream -> ws://host/stream/mse_ld  (fMP4, real time)
+    //   m4f://host/stream -> http://host/stream/mpegts (MPEG-TS over HTTP)
+    if (scheme == QLatin1String("m4s") || scheme == QLatin1String("m4ss")) {
+        url.setScheme(scheme == QLatin1String("m4ss") ? QStringLiteral("wss") : QStringLiteral("ws"));
+        QString path = url.path();
+        while (path.endsWith(QLatin1Char('/')))
+            path.chop(1);
+        url.setPath(path + QStringLiteral("/mse_ld"));
+        scheme = url.scheme();
+    } else if (scheme == QLatin1String("m4f") || scheme == QLatin1String("m4fs")) {
+        url.setScheme(scheme == QLatin1String("m4fs") ? QStringLiteral("https") : QStringLiteral("http"));
+        QString path = url.path();
+        while (path.endsWith(QLatin1Char('/')))
+            path.chop(1);
+        url.setPath(path + QStringLiteral("/mpegts"));
+        scheme = url.scheme();
+    }
+
+    Source k = Source::Other;
+    const QString path = url.path().toLower();
+    if (scheme.startsWith(QLatin1String("rtsp")))
+        k = Source::Rtsp;
+    else if (scheme == QLatin1String("ws") || scheme == QLatin1String("wss"))
+        k = Source::MseLd;
+    else if (scheme == QLatin1String("test"))
+        k = Source::Test;
+    else if (scheme == QLatin1String("http") || scheme == QLatin1String("https"))
+        k = (path.endsWith(QLatin1String(".jpg")) || path.endsWith(QLatin1String(".jpeg")))
+                ? Source::Snapshot : Source::HttpStream;
+    if (kind)
+        *kind = k;
+    return url;
+}
+
+bool Player::webSocketsAvailable()
+{
+#ifdef HMI_HAVE_WEBSOCKETS
+    return true;
+#else
+    return false;
+#endif
+}
+
+QString Player::sourceType() const
+{
+    Source k = Source::Other;
+    const QUrl url = resolveUrl(m_url, &k);
+    const QString path = url.path().toLower();
+    switch (k) {
+    case Source::Rtsp: return QStringLiteral("RTSP");
+    case Source::Snapshot: return QStringLiteral("JPEG");
+    case Source::MseLd: return QStringLiteral("MSE-LD");
+    case Source::Test: return QStringLiteral("TEST");
+    case Source::HttpStream:
+        if (path.endsWith(QLatin1String(".m3u8"))) return QStringLiteral("HLS");
+        if (path.endsWith(QLatin1String(".mpd"))) return QStringLiteral("DASH");
+        if (path.contains(QLatin1String(".ism"))) return QStringLiteral("MSS");
+        if (path.endsWith(QLatin1String("mpegts")) || path.endsWith(QLatin1String(".ts")))
+            return QStringLiteral("MPEG-TS");
+        return QStringLiteral("HTTP");
+    default: return QString();
+    }
+}
+
+GstElement *Player::makeAppSrc(const char *caps, bool doTimestamp)
+{
+    GstElement *src = make("appsrc");
+    if (!src)
+        return nullptr;
+    GstCaps *c = gst_caps_from_string(caps);
+    gst_app_src_set_caps(GST_APP_SRC(src), c);
+    gst_caps_unref(c);
+    gst_app_src_set_stream_type(GST_APP_SRC(src), GST_APP_STREAM_TYPE_STREAM);
+    gst_app_src_set_max_bytes(GST_APP_SRC(src), 16 * 1024 * 1024);
+    gsu::setArg(src, "is-live", QStringLiteral("true"));
+    gsu::setArg(src, "format", QStringLiteral("time"));
+    gsu::setArg(src, "block", QStringLiteral("false"));
+    gsu::setArg(src, "do-timestamp", doTimestamp ? QStringLiteral("true") : QStringLiteral("false"));
+    return src;
+}
+
+void Player::pushToAppSrc(const QByteArray &data)
+{
+    if (!m_appsrc || data.isEmpty())
+        return;
+    GstBuffer *buf = gst_buffer_new_allocate(nullptr, gsize(data.size()), nullptr);
+    gst_buffer_fill(buf, 0, data.constData(), gsize(data.size()));
+    gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), buf);   // takes ownership
+}
+
+void Player::stopNetworkSources()
+{
+    m_snapshotTimer.stop();
+    if (m_snapReply) {
+        m_snapReply->disconnect(this);
+        m_snapReply->abort();
+        m_snapReply->deleteLater();
+        m_snapReply = nullptr;
+    }
+#ifdef HMI_HAVE_WEBSOCKETS
+    if (m_ws) {
+        m_ws->disconnect(this);
+        m_ws->abort();
+        m_ws->deleteLater();
+        m_ws = nullptr;
+    }
+#endif
+    m_mseTrack = -1;
+    m_mseInit = false;
+    m_appsrc = nullptr;
+}
+
+static void addBasicAuth(QNetworkRequest &req, const QString &user, const QString &pass)
+{
+    if (user.isEmpty())
+        return;
+    req.setRawHeader("Authorization", "Basic " + (user + QLatin1Char(':') + pass).toUtf8().toBase64());
+}
+
+void Player::requestSnapshot()
+{
+    if (!m_pipeline || !m_appsrc)
+        return;
+    if (!m_nam)
+        m_nam = new QNetworkAccessManager(this);
+    QNetworkRequest req(m_sourceUrl);
+    req.setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::AlwaysNetwork);
+    req.setTransferTimeout(15000);
+    addBasicAuth(req, m_username, m_password);
+    QNetworkReply *reply = m_nam->get(req);
+    m_snapReply = reply;
+    const quint64 gen = m_gen;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, gen] {
+        reply->deleteLater();
+        if (gen != m_gen || !m_pipeline)
+            return;
+        m_snapReply = nullptr;
+        if (reply->error() != QNetworkReply::NoError) {
+            scheduleRetry(reply->errorString());
+            return;
+        }
+        pushToAppSrc(reply->readAll());
+        m_snapshotTimer.start(qMax(100, m_snapshotInterval));
+    });
+}
+
+void Player::startMseLd(const QUrl &url)
+{
+#ifdef HMI_HAVE_WEBSOCKETS
+    m_ws = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
+    const quint64 gen = m_gen;
+    connect(m_ws, &QWebSocket::textMessageReceived, this, [this, gen](const QString &m) { onMseText(gen, m); });
+    connect(m_ws, &QWebSocket::binaryMessageReceived, this, [this, gen](const QByteArray &d) { onMseBinary(gen, d); });
+    connect(m_ws, &QWebSocket::disconnected, this, [this, gen] {
+        if (gen == m_gen && m_pipeline)
+            scheduleRetry(QStringLiteral("WebSocket закрыт") + (m_ws && !m_ws->closeReason().isEmpty()
+                                                                   ? QStringLiteral(": ") + m_ws->closeReason()
+                                                                   : QString()));
+    });
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    connect(m_ws, &QWebSocket::errorOccurred, this, [this, gen](QAbstractSocket::SocketError) {
+#else
+    connect(m_ws, qOverload<QAbstractSocket::SocketError>(&QWebSocket::error), this, [this, gen](QAbstractSocket::SocketError) {
+#endif
+        if (gen == m_gen && m_pipeline)
+            scheduleRetry(m_ws ? m_ws->errorString() : QStringLiteral("Ошибка WebSocket"));
+    });
+    QNetworkRequest req(url);
+    addBasicAuth(req, m_username, m_password);
+    m_ws->open(req);
+#else
+    Q_UNUSED(url)
+#endif
+}
+
+void Player::onMseText(quint64 gen, const QString &msg)
+{
+#ifdef HMI_HAVE_WEBSOCKETS
+    if (gen != m_gen || !m_pipeline)
+        return;
+    const QJsonObject o = QJsonDocument::fromJson(msg.toUtf8()).object();
+    if (o.value(QLatin1String("type")).toString() != QLatin1String("mse_init_segment"))
+        return;   // events, statistics
+    if (m_mseInit) {
+        // New initialisation (track change / server restart): start over.
+        scheduleRetry(QStringLiteral("Параметры потока изменились"));
+        return;
+    }
+    const QJsonArray tracks = o.value(QLatin1String("tracks")).toArray();
+    QJsonObject video;
+    for (const QJsonValue &v : tracks) {
+        const QJsonObject t = v.toObject();
+        const QString content = t.value(QLatin1String("content")).toString();
+        if (content == QLatin1String("video") || (content.isEmpty() && video.isEmpty()))
+            video = t;
+        if (content == QLatin1String("video"))
+            break;
+    }
+    if (video.isEmpty()) {
+        scheduleRetry(QStringLiteral("В потоке MSE-LD нет видеодорожки"));
+        return;
+    }
+    m_mseTrack = video.value(QLatin1String("id")).toInt(1);
+    m_mseInit = true;
+    pushToAppSrc(QByteArray::fromBase64(video.value(QLatin1String("payload")).toString().toLatin1()));
+    m_ws->sendTextMessage(QStringLiteral("resume"));
+#else
+    Q_UNUSED(gen) Q_UNUSED(msg)
+#endif
+}
+
+void Player::onMseBinary(quint64 gen, const QByteArray &data)
+{
+    if (gen != m_gen || !m_pipeline || !m_mseInit)
+        return;
+    // Media fragment (moof+mdat) of one track; byte 47 = tfhd track_id.
+    if (data.size() > 47 && int(uchar(data.at(47))) == m_mseTrack)
+        pushToAppSrc(data);
 }
 
 void Player::teardown(bool synchronous)
 {
     m_watchdog.stop();
+    stopNetworkSources();
     if (m_fps != 0) {
         m_fps = 0;
         Q_EMIT statsChanged();
@@ -1005,19 +1407,41 @@ void Player::onWatchdog()
     }
     if (m_status == Playing) {
         m_stallTicks = delta == 0 ? m_stallTicks + 1 : 0;
-        if (m_stallTicks >= 10)
-            scheduleRetry(QStringLiteral("Нет видеоданных более 10 с"));
+        if (m_stallTicks >= m_stallLimit)
+            scheduleRetry(QStringLiteral("Нет видеоданных более %1 с").arg(m_stallLimit));
     } else if (!m_gotFrame) {
-        if (++m_connectTicks >= 25)
+        if (++m_connectTicks >= qMax(25, m_stallLimit))
             scheduleRetry(QStringLiteral("Таймаут подключения"));
     }
+}
+
+// Short Russian explanation for the most common GStreamer errors.
+static QString explainError(const QString &msg)
+{
+    static const struct { const char *needle; const char *text; } map[] = {
+        {"Unauthorized", "Ошибка авторизации: проверьте логин и пароль"},
+        {"401", "Ошибка авторизации: проверьте логин и пароль"},
+        {"403", "Доступ запрещён (403)"},
+        {"Not Found", "Поток не найден (404): проверьте адрес"},
+        {"404", "Поток не найден (404): проверьте адрес"},
+        {"Could not open resource", "Не удалось подключиться к источнику"},
+        {"Could not resolve", "Не удалось найти сервер по имени"},
+        {"Could not read from resource", "Ошибка чтения из источника"},
+        {"Internal data stream error", "Поток прерван"},
+        {"Could not connect", "Не удалось подключиться к источнику"},
+        {"timeout", "Таймаут сети"},
+    };
+    for (const auto &m : map)
+        if (msg.contains(QLatin1String(m.needle), Qt::CaseInsensitive))
+            return QString::fromUtf8(m.text);
+    return msg;
 }
 
 void Player::onPipelineError(quint64 gen, const QString &msg)
 {
     if (gen != m_gen || !m_pipeline)
         return;
-    scheduleRetry(msg);
+    scheduleRetry(explainError(msg));
 }
 
 void Player::onDecoderSelected(quint64 gen, const QString &codec, const QString &decoder, bool hw)

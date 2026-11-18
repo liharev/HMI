@@ -278,7 +278,7 @@ Item {
                 font.pixelSize: 11
                 text: {
                     const p = tile.player
-                    let s = p.codec
+                    let s = (p.sourceType ? p.sourceType + " · " : "") + p.codec
                     if (p.videoWidth > 0)
                         s += "  " + p.videoWidth + "×" + p.videoHeight
                     s += "  " + p.fps.toFixed(0) + " к/с"

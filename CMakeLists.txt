@@ -11,6 +11,8 @@ option(HMI_CPU_TUNING "Tune code for the RK3588 CPU cores (Cortex-A76/A55) on aa
 option(HMI_LTO "Enable link-time optimisation" ON)
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Network)
+# Optional: Flussonic MSE-LD (fMP4 over WebSocket) playback.
+find_package(Qt6 6.4 QUIET OPTIONAL_COMPONENTS WebSockets)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GST REQUIRED IMPORTED_TARGET
     gstreamer-1.0>=1.20 gstreamer-video-1.0>=1.20 gstreamer-app-1.0>=1.20)
@@ -67,6 +69,14 @@ if(HMI_LTO)
     if(HMI_IPO)
         set_property(TARGET hmi-vms PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     endif()
+endif()
+
+if(TARGET Qt6::WebSockets)
+    target_link_libraries(hmi-vms PRIVATE Qt6::WebSockets)
+    target_compile_definitions(hmi-vms PRIVATE HMI_HAVE_WEBSOCKETS)
+    message(STATUS "MSE-LD (WebSocket) playback: enabled")
+else()
+    message(WARNING "Qt6 WebSockets not found (qt6-websockets-dev): MSE-LD / ws:// playback disabled")
 endif()
 
 include(GNUInstallDirs)
