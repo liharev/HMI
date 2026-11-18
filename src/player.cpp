@@ -582,8 +582,12 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     p->m_flipV = o.value(QLatin1String("flipV")).toBool(false);
     p->m_webUrl = o.value(QLatin1String("webUrl")).toString();
     p->m_output = qBound(0, o.value(QLatin1String("output")).toInt(OutputAuto), 3);
-    p->m_learned = qBound(1, o.value(QLatin1String("autoOutput")).toInt(OutputGl), 3);
-    p->m_hwSlow = o.value(QLatin1String("autoSoftware")).toBool(false);
+    // Fallbacks learned by versions before 2 were caused by an HLS/DASH bug
+    // (leaky queue), not by the hardware: discard them.
+    if (o.value(QLatin1String("autoVersion")).toInt(0) >= 2) {
+        p->m_learned = qBound(1, o.value(QLatin1String("autoOutput")).toInt(OutputGl), 3);
+        p->m_hwSlow = o.value(QLatin1String("autoSoftware")).toBool(false);
+    }
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -617,6 +621,7 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("output"), m_output);
     o.insert(QLatin1String("autoOutput"), m_learned);
     o.insert(QLatin1String("autoSoftware"), m_hwSlow);
+    o.insert(QLatin1String("autoVersion"), 2);
     return o;
 }
 
@@ -943,11 +948,20 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
 {
     GstElement *bin = gst_bin_new("tail");
     GstElement *queue = make("queue");
-    // Keep at most 2 decoded frames: drop old ones instead of adding latency.
-    gsu::setArg(queue, "max-size-buffers", QStringLiteral("2"));
     gsu::setArg(queue, "max-size-bytes", QStringLiteral("0"));
     gsu::setArg(queue, "max-size-time", QStringLiteral("0"));
-    gsu::setArg(queue, "leaky", QStringLiteral("downstream"));
+    if (ctx->forceSync) {
+        // HLS/DASH/MSS: a segment is decoded much faster than real time and
+        // must be shown paced by the clock. A leaky queue would throw away
+        // almost the whole segment (seen as ~0.5 fps): block the decoder
+        // instead (back-pressure), the demuxer buffers the rest.
+        gsu::setArg(queue, "max-size-buffers", QStringLiteral("4"));
+    } else {
+        // Live sources: keep at most 2 decoded frames, drop old ones instead
+        // of accumulating latency.
+        gsu::setArg(queue, "max-size-buffers", QStringLiteral("2"));
+        gsu::setArg(queue, "leaky", QStringLiteral("downstream"));
+    }
     const QString sync = (m_lowLatency && !ctx->forceSync) ? QStringLiteral("false") : QStringLiteral("true");
 
     QList<GstElement *> elems{queue};
