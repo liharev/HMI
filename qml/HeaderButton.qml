@@ -7,7 +7,8 @@ AbstractButton {
     property color fg: "white"
     property string tip: ""
     implicitWidth: label.implicitWidth + 18
-    implicitHeight: 30
+    implicitHeight: Math.max(30, label.implicitHeight + 10)
+    font.bold: checked
     hoverEnabled: true
     focusPolicy: Qt.NoFocus
 
@@ -15,8 +16,8 @@ AbstractButton {
         id: label
         text: control.text
         color: control.fg
-        font.pixelSize: control.font.pixelSize > 0 ? control.font.pixelSize : 13
-        font.bold: control.checked
+        font: control.font
+        // bold when checked is set via font below
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
     }

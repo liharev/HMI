@@ -17,6 +17,8 @@
 
 #include <gst/gst.h>
 
+#include <atomic>
+
 class QQuickItem;
 class QVideoSink;
 class QNetworkAccessManager;
@@ -38,6 +40,11 @@ class Player : public QObject
     Q_PROPERTY(bool lowLatency READ lowLatency NOTIFY configChanged)
     Q_PROPERTY(int snapshotInterval READ snapshotInterval NOTIFY configChanged)
     Q_PROPERTY(QString sourceType READ sourceType NOTIFY configChanged)
+    Q_PROPERTY(QString webUrl READ webUrl WRITE setWebUrl NOTIFY configChanged)
+    // --- orientation (persistent) ---
+    Q_PROPERTY(int rotation READ rotation WRITE setRotation NOTIFY orientationChanged)
+    Q_PROPERTY(bool flipH READ flipH WRITE setFlipH NOTIFY orientationChanged)
+    Q_PROPERTY(bool flipV READ flipV WRITE setFlipV NOTIFY orientationChanged)
     Q_PROPERTY(bool active READ active NOTIFY activeChanged)
     Q_PROPERTY(qint64 created READ created CONSTANT)
     // --- geometry ---
@@ -48,6 +55,8 @@ class Player : public QObject
     Q_PROPERTY(qreal posY READ posY WRITE setPosY NOTIFY posChanged)
     Q_PROPERTY(qreal layoutX READ layoutX NOTIFY layoutChanged)
     Q_PROPERTY(qreal layoutY READ layoutY NOTIFY layoutChanged)
+    Q_PROPERTY(qreal layoutWidth READ layoutWidth NOTIFY layoutChanged)
+    Q_PROPERTY(qreal layoutHeight READ layoutHeight NOTIFY layoutChanged)
     Q_PROPERTY(int order READ order NOTIFY orderChanged)
     // --- runtime state ---
     Q_PROPERTY(int status READ status NOTIFY statusChanged)
@@ -57,7 +66,14 @@ class Player : public QObject
     Q_PROPERTY(QString codec READ codec NOTIFY videoInfoChanged)
     Q_PROPERTY(QString decoderName READ decoderName NOTIFY videoInfoChanged)
     Q_PROPERTY(bool hardwareDecoding READ hardwareDecoding NOTIFY videoInfoChanged)
-    Q_PROPERTY(qreal fps READ fps NOTIFY statsChanged)
+    Q_PROPERTY(qreal fps READ fps NOTIFY statsChanged)              // decoded frames/s
+    Q_PROPERTY(qreal inFps READ inFps NOTIFY statsChanged)          // received (to decoder)
+    Q_PROPERTY(qreal shownFps READ shownFps NOTIFY statsChanged)    // delivered to the screen
+    Q_PROPERTY(qreal nominalFps READ nominalFps NOTIFY statsChanged) // from the stream, 0 = unknown
+    Q_PROPERTY(qreal frameAge READ frameAge NOTIFY statsChanged)    // s since the last frame
+    // Traffic light: -1 none (stopped), 0 green, 1 yellow, 2 red.
+    Q_PROPERTY(int health READ health NOTIFY statsChanged)
+    Q_PROPERTY(QString healthText READ healthText NOTIFY statsChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -66,6 +82,8 @@ public:
     Q_ENUM(Transport)
     enum Decoder { DecoderAuto, DecoderHardware, DecoderSoftware };
     Q_ENUM(Decoder)
+    enum Health { HealthNone = -1, HealthGood = 0, HealthWarning = 1, HealthBad = 2 };
+    Q_ENUM(Health)
 
     static constexpr qreal kMinWidth = 160;
     static constexpr qreal kMaxWidth = 7680;
@@ -91,6 +109,21 @@ public:
     bool lowLatency() const { return m_lowLatency; }
     int snapshotInterval() const { return m_snapshotInterval; }
     QString sourceType() const;     // human readable protocol name
+    QString webUrl() const { return m_webUrl; }
+    void setWebUrl(const QString &u);
+    // Camera web interface address with a scheme ("" if not configured).
+    Q_INVOKABLE QString webPageUrl() const;
+    // Host of the stream address (suggestion for the web interface).
+    Q_INVOKABLE QString streamHost() const;
+
+    int rotation() const { return m_rotation; }
+    void setRotation(int r);
+    bool flipH() const { return m_flipH; }
+    void setFlipH(bool f);
+    bool flipV() const { return m_flipV; }
+    void setFlipV(bool f);
+    Q_INVOKABLE void rotateBy(int degrees);
+    Q_INVOKABLE void resetOrientation();
 
     // Kind of source, derived from the URL.
     enum class Source { Rtsp, HttpStream, Snapshot, MseLd, Test, Other };
@@ -103,14 +136,17 @@ public:
     qreal displayWidth() const { return m_displayWidth; }
     void setDisplayWidth(qreal w);
     qreal displayHeight() const { return m_displayWidth / aspect(); }
-    qreal aspect() const;
+    qreal aspect() const;           // displayed aspect (rotation applied)
+    qreal videoAspect() const;      // aspect of the stream itself
     qreal posX() const { return m_posX; }
     void setPosX(qreal x);
     qreal posY() const { return m_posY; }
     void setPosY(qreal y);
     qreal layoutX() const { return m_layoutX; }
     qreal layoutY() const { return m_layoutY; }
-    void setLayoutPos(qreal x, qreal y);
+    qreal layoutWidth() const { return m_layoutW; }
+    qreal layoutHeight() const { return m_layoutH; }
+    void setLayoutRect(qreal x, qreal y, qreal w, qreal h);
     int order() const { return m_order; }
     void setOrder(int o);
 
@@ -122,6 +158,14 @@ public:
     QString decoderName() const { return m_decoderName; }
     bool hardwareDecoding() const { return m_hwDecoding; }
     qreal fps() const { return m_fps; }
+    qreal inFps() const { return m_inFps; }
+    qreal shownFps() const { return m_shownFps; }
+    qreal nominalFps() const { return m_nominalFps; }
+    qreal frameAge() const { return m_frameAge; }
+    int health() const { return m_health; }
+    QString healthText() const { return m_healthText; }
+    // Frames/s the window actually renders (measured by the window).
+    void setRenderFps(qreal fps) { m_renderFps = fps; }
 
     Q_INVOKABLE QVariantMap config() const;
     Q_INVOKABLE void applyConfig(const QVariantMap &cfg);
@@ -148,6 +192,7 @@ Q_SIGNALS:
     void geometryChanged();
     void posChanged();
     void layoutChanged();
+    void orientationChanged();
     void orderChanged();
     void statusChanged();
     void videoInfoChanged();
@@ -174,7 +219,8 @@ private:
     // Events delivered from streaming threads (queued to the GUI thread).
     void onPipelineError(quint64 gen, const QString &msg);
     void onDecoderSelected(quint64 gen, const QString &codec, const QString &decoder, bool hw);
-    void onVideoSize(quint64 gen, int w, int h, int parN, int parD);
+    void onVideoSize(quint64 gen, int w, int h, int parN, int parD, int fpsN, int fpsD);
+    void updateHealth();
     void onFirstFrame(quint64 gen);
 
     GstElement *buildTail(PipelineCtx *ctx, QString *error);
@@ -204,7 +250,13 @@ private:
     qreal m_posY = 0;
     qreal m_layoutX = 0;
     qreal m_layoutY = 0;
+    qreal m_layoutW = 0;
+    qreal m_layoutH = 0;
     int m_order = 0;
+    int m_rotation = 0;
+    bool m_flipH = false;
+    bool m_flipV = false;
+    QString m_webUrl;
     qreal m_savedAspect = 16.0 / 9.0;   // last known video aspect (persisted)
 
     // runtime
@@ -216,6 +268,18 @@ private:
     QString m_decoderName;
     bool m_hwDecoding = false;
     qreal m_fps = 0;
+    qreal m_inFps = 0;
+    qreal m_shownFps = 0;
+    qreal m_nominalFps = 0;
+    qreal m_frameAge = 0;
+    qreal m_renderFps = -1;
+    int m_health = HealthNone;
+    QString m_healthText;
+    quint64 m_lastIn = 0;
+    quint64 m_lastShown = 0;
+    qint64 m_statsUs = 0;
+    qint64 m_lastReconnectMs = 0;
+    std::atomic<quint64> m_qtShown{0};   // frames handed to QVideoSink
 
     bool m_suspended = false;
     bool m_hwFailed = false;     // auto mode: HW decoder failed -> use software

@@ -9,7 +9,8 @@ Dialog {
 
     parent: Overlay.overlay
     anchors.centerIn: parent
-    width: Math.min(460, parent ? parent.width - 40 : 460)
+    FontMetrics { id: fm; font: dlg.font }
+    width: Math.min(fm.height * 28, parent ? parent.width - 24 : 460)
     modal: true
 
     contentItem: Label {

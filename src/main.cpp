@@ -6,6 +6,7 @@
 #include "vmswindow.h"
 
 #include <QCommandLineParser>
+#include <QFont>
 #include <QGuiApplication>
 #include <QLocalSocket>
 #include <QPalette>
@@ -75,7 +76,7 @@ int main(int argc, char *argv[])
     QGuiApplication app(argc, argv);
     QGuiApplication::setApplicationName(QStringLiteral("hmi-vms"));
     QGuiApplication::setOrganizationName(QStringLiteral("hmi"));
-    QGuiApplication::setApplicationDisplayName(QStringLiteral("HMI VMS"));
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("CAMAI VMS"));
     QGuiApplication::setApplicationVersion(QStringLiteral(HMI_VERSION));
     QGuiApplication::setDesktopFileName(QStringLiteral("hmi-vms"));
 
@@ -88,11 +89,15 @@ int main(int argc, char *argv[])
                                  QStringLiteral("mode"), QStringLiteral("auto"));
     QCommandLineOption configOpt(QStringList{QStringLiteral("c"), QStringLiteral("config")},
                                  QStringLiteral("Файл конфигурации раскладки."), QStringLiteral("file"));
+    QCommandLineOption fontOpt(QStringLiteral("font-scale"),
+                               QStringLiteral("Масштаб шрифта интерфейса, например 1.25 (также HMI_FONT_SCALE)."),
+                               QStringLiteral("factor"));
     QCommandLineOption separateOpt(QStringLiteral("separate"),
                                    QStringLiteral("Не передавать запуск уже работающему экземпляру."));
     parser.addOption(renderOpt);
     parser.addOption(configOpt);
     parser.addOption(separateOpt);
+    parser.addOption(fontOpt);
     parser.process(app);
 
     const bool separate = parser.isSet(separateOpt) || parser.isSet(configOpt);
@@ -119,7 +124,7 @@ int main(int argc, char *argv[])
         }
     }
     Player::setGlRendering(glSink);
-    qInfo("HMI VMS %s: render=%s, HW decoders: %s", HMI_VERSION, glSink ? "qml6glsink" : "QVideoSink",
+    qInfo("CAMAI VMS %s: render=%s, HW decoders: %s", HMI_VERSION, glSink ? "qml6glsink" : "QVideoSink",
           qPrintable(gsu::hardwareSummary()));
 
     // Teardown of RTSP pipelines runs in this pool (may block on network).
@@ -127,6 +132,21 @@ int main(int argc, char *argv[])
 
     QQuickStyle::setStyle(QStringLiteral("Fusion"));
     applyDarkPalette(app);
+
+    // Optional extra font scaling on top of the system font size.
+    QString fontScale = parser.value(fontOpt);
+    if (fontScale.isEmpty())
+        fontScale = qEnvironmentVariable("HMI_FONT_SCALE");
+    bool okScale = false;
+    const double scale = fontScale.toDouble(&okScale);
+    if (okScale && scale >= 0.5 && scale <= 4.0) {
+        QFont f = QGuiApplication::font();
+        if (f.pointSizeF() > 0)
+            f.setPointSizeF(f.pointSizeF() * scale);
+        else if (f.pixelSize() > 0)
+            f.setPixelSize(qRound(f.pixelSize() * scale));
+        QGuiApplication::setFont(f);
+    }
 
     QQmlApplicationEngine engine;
     engine.addImportPath(QStringLiteral("qrc:/"));

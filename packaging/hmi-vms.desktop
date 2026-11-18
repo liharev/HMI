@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=HMI VMS
-Name[ru]=HMI VMS — видеонаблюдение
+Name=CAMAI VMS
+Name[ru]=CAMAI VMS — видеонаблюдение
 Comment=Video surveillance workstation (RTSP, H.264/H.265/MJPEG)
 Comment[ru]=Рабочее место администратора видеонаблюдения
 Exec=hmi-vms

@@ -58,9 +58,16 @@ class VmsWindow : public QObject
     Q_PROPERTY(bool autoSort READ autoSort WRITE setAutoSort NOTIFY sortChanged)
     Q_PROPERTY(bool fullScreen READ fullScreen NOTIFY placementChanged)
     Q_PROPERTY(QString screenName READ screenName NOTIFY placementChanged)
+    Q_PROPERTY(int gridRows READ gridRows NOTIFY gridChanged)
+    Q_PROPERTY(int gridCols READ gridCols NOTIFY gridChanged)
+    Q_PROPERTY(qreal cellWidth READ cellWidth NOTIFY contentSizeChanged)
+    Q_PROPERTY(qreal cellHeight READ cellHeight NOTIFY contentSizeChanged)
+    Q_PROPERTY(QString wallpaper READ wallpaper WRITE setWallpaper NOTIFY wallpaperChanged)
+    Q_PROPERTY(qreal wallpaperDim READ wallpaperDim WRITE setWallpaperDim NOTIFY wallpaperChanged)
+    Q_PROPERTY(qreal renderFps READ renderFps NOTIFY renderFpsChanged)
 
 public:
-    enum LayoutMode { Flow = 0, Free = 1 };
+    enum LayoutMode { Flow = 0, Free = 1, Grid = 2 };
     Q_ENUM(LayoutMode)
 
     static constexpr qreal kMargin = 6;
@@ -105,6 +112,23 @@ public:
 
     QList<Player *> ordered() const;
 
+    int gridRows() const { return m_gridRows; }
+    int gridCols() const { return m_gridCols; }
+    qreal cellWidth() const { return m_cellW; }
+    qreal cellHeight() const { return m_cellH; }
+    // N rows x M columns of equal cells filling the window.
+    Q_INVOKABLE void setGrid(int rows, int cols);
+    // Top-left of grid cell `index` (row-major), for empty-cell placeholders.
+    Q_INVOKABLE QPointF cellPos(int index) const;
+
+    QString wallpaper() const { return m_wallpaper; }
+    void setWallpaper(const QString &w);
+    qreal wallpaperDim() const { return m_wallpaperDim; }
+    void setWallpaperDim(qreal d);
+
+    qreal renderFps() const { return m_renderFps; }
+    void setRenderFps(qreal fps);
+
     Q_INVOKABLE Player *addPlayer(const QVariantMap &cfg);
     Q_INVOKABLE void removePlayer(Player *p);
     // Manual sorting: move to position `index` (in display order).
@@ -132,6 +156,9 @@ Q_SIGNALS:
     void contentSizeChanged();
     void sortChanged();
     void placementChanged();
+    void gridChanged();
+    void wallpaperChanged();
+    void renderFpsChanged();
     void changed();          // anything persistent changed -> save
 
 private:
@@ -158,5 +185,12 @@ private:
     bool m_fullScreen = false;
     QString m_screenName;
     bool m_relayoutQueued = false;
+    int m_gridRows = 2;
+    int m_gridCols = 2;
+    qreal m_cellW = 0;
+    qreal m_cellH = 0;
+    QString m_wallpaper;
+    qreal m_wallpaperDim = 0.0;
+    qreal m_renderFps = -1;
     bool m_inSort = false;
 };

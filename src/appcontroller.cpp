@@ -18,6 +18,8 @@
 #include <QSaveFile>
 #include <QScreen>
 #include <QThreadPool>
+#include <QOpenGLContext>
+#include <QOpenGLFunctions>
 
 namespace {
 const char *const kPalette[] = {"#2563eb", "#16a34a", "#dc2626", "#d97706", "#7c3aed",
@@ -33,6 +35,16 @@ AppController::AppController(QQmlEngine *engine, bool glSink, const QString &con
     m_saveTimer.setSingleShot(true);
     m_saveTimer.setInterval(1500);
     connect(&m_saveTimer, &QTimer::timeout, this, &AppController::save);
+
+    // Frames per second each window really renders (for the traffic lights).
+    m_fpsTimer.setInterval(1000);
+    m_fpsClock.start();
+    connect(&m_fpsTimer, &QTimer::timeout, this, [this] {
+        const qreal dt = qMax<qint64>(200, m_fpsClock.restart()) / 1000.0;   // real elapsed time
+        for (auto it = m_frameCounters.begin(); it != m_frameCounters.end(); ++it)
+            it.key()->setRenderFps(it.value()->exchange(0) / dt);
+    });
+    m_fpsTimer.start();
 
     auto *app = qobject_cast<QGuiApplication *>(QCoreApplication::instance());
     connect(app, &QGuiApplication::screenAdded, this, &AppController::screensChanged);
@@ -76,6 +88,26 @@ QString AppController::renderBackend() const
 QString AppController::hardwareDecoders() const
 {
     return gsu::hardwareSummary();
+}
+
+bool AppController::softwareRendering() const
+{
+    const QString r = m_glRenderer.toLower();
+    return r.contains(QLatin1String("llvmpipe")) || r.contains(QLatin1String("softpipe"))
+           || r.contains(QLatin1String("swrast")) || r.contains(QLatin1String("software"));
+}
+
+QVariantList AppController::builtinWallpapers() const
+{
+    static const char *const names[][2] = {
+        {"camai-grid", "Сетка"},     {"camai-lens", "Объектив"}, {"camai-network", "Нейросеть"},
+        {"camai-hex", "Соты"},       {"camai-waves", "Волны"},   {"camai-graphite", "Графит"},
+    };
+    QVariantList l;
+    for (const auto &n : names)
+        l << QVariantMap{{QStringLiteral("url"), QStringLiteral("qrc:/wallpapers/%1.jpg").arg(QLatin1String(n[0]))},
+                         {QStringLiteral("name"), QString::fromUtf8(n[1])}};
+    return l;
 }
 
 QString AppController::version() const
@@ -194,6 +226,29 @@ void AppController::createView(VmsWindow *w)
     }
     QQmlEngine::setObjectOwnership(view, QQmlEngine::CppOwnership);
     m_views.insert(w, view);
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    m_frameCounters.insert(w, counter);
+    connect(view, &QQuickWindow::frameSwapped, view, [counter] { counter->fetch_add(1, std::memory_order_relaxed); },
+            Qt::DirectConnection);
+    if (m_glRenderer.isEmpty()) {
+        // Which GPU renders the UI: llvmpipe means no hardware acceleration.
+        connect(view, &QQuickWindow::sceneGraphInitialized, view, [this] {
+            QString r;
+            if (QOpenGLContext *ctx = QOpenGLContext::currentContext()) {
+                QOpenGLFunctions *f = ctx->functions();
+                const auto *ren = reinterpret_cast<const char *>(f->glGetString(GL_RENDERER));
+                const auto *ver = reinterpret_cast<const char *>(f->glGetString(GL_VERSION));
+                r = QString::fromLatin1(ren ? ren : "?") + QStringLiteral(" — ") + QString::fromLatin1(ver ? ver : "?");
+            }
+            QMetaObject::invokeMethod(this, [this, r] {
+                if (m_glRenderer.isEmpty() && !r.isEmpty()) {
+                    m_glRenderer = r;
+                    qInfo("GL renderer: %s", qPrintable(r));
+                    Q_EMIT glInfoChanged();
+                }
+            }, Qt::QueuedConnection);
+        }, Qt::DirectConnection);
+    }
     w->setOpen(true);
     w->setSuspended(false);
 
@@ -250,6 +305,8 @@ void AppController::destroyView(VmsWindow *w)
     if (!view)
         return;
     QObject::disconnect(view, nullptr, w, nullptr);
+    m_frameCounters.remove(w);
+    w->setRenderFps(-1);
     // Release GL video sinks while the window's GL context still exists.
     // Players stay "active"; they resume when the window is opened again.
     w->setSuspended(true, true);

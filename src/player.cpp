@@ -59,7 +59,11 @@ struct PipelineCtx
     GstElement *tail = nullptr;
     std::atomic<bool> linked{false};
     std::atomic<int> videoStream{-1};
-    std::atomic<quint64> frames{0};
+    std::atomic<quint64> frames{0};      // decoded (tail input)
+    std::atomic<quint64> inFrames{0};    // compressed frames into the decoder
+    std::atomic<quint64> shown{0};       // frames reaching the video sink
+    std::atomic<qint64> lastFrameUs{0};  // monotonic time of the last decoded frame
+    std::atomic<bool> hasDecoderProbe{false};
 
     QMutex mutex;
     bool alive = true;
@@ -232,6 +236,7 @@ struct PipelineCallbacks
     {
         auto *ctx = static_cast<PipelineCtx *>(data);
         if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+            ctx->lastFrameUs.store(g_get_monotonic_time(), std::memory_order_relaxed);
             if (ctx->frames.fetch_add(1, std::memory_order_relaxed) == 0) {
                 Player *p = ctx->player;
                 const quint64 g = ctx->gen;
@@ -243,15 +248,22 @@ struct PipelineCallbacks
                 GstCaps *caps = nullptr;
                 gst_event_parse_caps(ev, &caps);
                 const GstStructure *s = caps ? gst_caps_get_structure(caps, 0) : nullptr;
-                int w = 0, h = 0, pn = 1, pd = 1;
+                int w = 0, h = 0, pn = 1, pd = 1, fn = 0, fd = 1;
                 if (s && gst_structure_get_int(s, "width", &w) && gst_structure_get_int(s, "height", &h)) {
                     gst_structure_get_fraction(s, "pixel-aspect-ratio", &pn, &pd);
+                    gst_structure_get_fraction(s, "framerate", &fn, &fd);
                     Player *p = ctx->player;
                     const quint64 g = ctx->gen;
-                    ctx->post([p, g, w, h, pn, pd] { p->onVideoSize(g, w, h, pn, pd); });
+                    ctx->post([p, g, w, h, pn, pd, fn, fd] { p->onVideoSize(g, w, h, pn, pd, fn, fd); });
                 }
             }
         }
+        return GST_PAD_PROBE_OK;
+    }
+
+    static GstPadProbeReturn countProbe(GstPad *, GstPadProbeInfo *, gpointer data)
+    {
+        static_cast<std::atomic<quint64> *>(data)->fetch_add(1, std::memory_order_relaxed);
         return GST_PAD_PROBE_OK;
     }
 
@@ -345,6 +357,12 @@ struct PipelineCallbacks
         if (!decoder)
             return fail(QStringLiteral("Не найден декодер %1").arg(gsu::codecName(codec)));
 
+        if (GstPad *dsink = gst_element_get_static_pad(decoder, "sink")) {
+            // Frames received from the network (statistics / traffic light).
+            gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->inFrames, nullptr);
+            gst_object_unref(dsink);
+            ctx->hasDecoderProbe = true;
+        }
         gst_element_sync_state_with_parent(decoder);
         for (int i = chain.size() - 1; i >= 0; --i)
             gst_element_sync_state_with_parent(chain[i]);
@@ -552,6 +570,10 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     p->m_posX = o.value(QLatin1String("x")).toDouble();
     p->m_posY = o.value(QLatin1String("y")).toDouble();
     p->m_order = o.value(QLatin1String("order")).toInt();
+    p->m_rotation = (((o.value(QLatin1String("rotation")).toInt(0) % 360) + 360) % 360 / 90) * 90;
+    p->m_flipH = o.value(QLatin1String("flipH")).toBool(false);
+    p->m_flipV = o.value(QLatin1String("flipV")).toBool(false);
+    p->m_webUrl = o.value(QLatin1String("webUrl")).toString();
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -577,7 +599,11 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("x"), m_posX);
     o.insert(QLatin1String("y"), m_posY);
     o.insert(QLatin1String("order"), m_order);
-    o.insert(QLatin1String("aspect"), aspect());
+    o.insert(QLatin1String("aspect"), videoAspect());
+    o.insert(QLatin1String("rotation"), m_rotation);
+    o.insert(QLatin1String("flipH"), m_flipH);
+    o.insert(QLatin1String("flipV"), m_flipV);
+    o.insert(QLatin1String("webUrl"), m_webUrl);
     return o;
 }
 
@@ -590,11 +616,84 @@ void Player::setName(const QString &n)
     Q_EMIT persistentChanged();
 }
 
-qreal Player::aspect() const
+qreal Player::videoAspect() const
 {
     if (m_videoWidth > 0 && m_videoHeight > 0)
         return qreal(m_videoWidth) / m_videoHeight;
     return m_savedAspect;
+}
+
+qreal Player::aspect() const
+{
+    const qreal a = videoAspect();
+    return (m_rotation % 180 == 90) ? 1.0 / a : a;
+}
+
+void Player::setRotation(int r)
+{
+    r = ((r % 360) + 360) % 360;
+    r = (r / 90) * 90;
+    if (r == m_rotation)
+        return;
+    m_rotation = r;
+    Q_EMIT orientationChanged();
+    Q_EMIT geometryChanged();     // 90/270 swap the aspect ratio
+    Q_EMIT persistentChanged();
+}
+
+void Player::setFlipH(bool f)
+{
+    if (f == m_flipH)
+        return;
+    m_flipH = f;
+    Q_EMIT orientationChanged();
+    Q_EMIT persistentChanged();
+}
+
+void Player::setFlipV(bool f)
+{
+    if (f == m_flipV)
+        return;
+    m_flipV = f;
+    Q_EMIT orientationChanged();
+    Q_EMIT persistentChanged();
+}
+
+void Player::rotateBy(int degrees)
+{
+    setRotation(m_rotation + degrees);
+}
+
+void Player::resetOrientation()
+{
+    setRotation(0);
+    setFlipH(false);
+    setFlipV(false);
+}
+
+void Player::setWebUrl(const QString &u)
+{
+    const QString v = u.trimmed();
+    if (v == m_webUrl)
+        return;
+    m_webUrl = v;
+    Q_EMIT configChanged();
+    Q_EMIT persistentChanged();
+}
+
+QString Player::webPageUrl() const
+{
+    if (m_webUrl.isEmpty())
+        return QString();
+    if (m_webUrl.contains(QLatin1String("://")))
+        return m_webUrl;
+    return QStringLiteral("http://") + m_webUrl;
+}
+
+QString Player::streamHost() const
+{
+    const QUrl u = resolveUrl(m_url, nullptr);
+    return u.host();
 }
 
 void Player::setDisplayWidth(qreal w)
@@ -627,12 +726,15 @@ void Player::setPosY(qreal y)
     Q_EMIT persistentChanged();
 }
 
-void Player::setLayoutPos(qreal x, qreal y)
+void Player::setLayoutRect(qreal x, qreal y, qreal w, qreal h)
 {
-    if (qFuzzyCompare(x + 1, m_layoutX + 1) && qFuzzyCompare(y + 1, m_layoutY + 1))
+    if (qFuzzyCompare(x + 1, m_layoutX + 1) && qFuzzyCompare(y + 1, m_layoutY + 1)
+        && qFuzzyCompare(w + 1, m_layoutW + 1) && qFuzzyCompare(h + 1, m_layoutH + 1))
         return;
     m_layoutX = x;
     m_layoutY = y;
+    m_layoutW = w;
+    m_layoutH = h;
     Q_EMIT layoutChanged();
 }
 
@@ -657,6 +759,10 @@ QVariantMap Player::config() const
         {QStringLiteral("decoder"), m_decoder},
         {QStringLiteral("lowLatency"), m_lowLatency},
         {QStringLiteral("snapshotInterval"), m_snapshotInterval},
+        {QStringLiteral("webUrl"), m_webUrl},
+        {QStringLiteral("rotation"), m_rotation},
+        {QStringLiteral("flipH"), m_flipH},
+        {QStringLiteral("flipV"), m_flipV},
     };
 }
 
@@ -670,6 +776,11 @@ void Player::applyConfig(const QVariantMap &c)
     const int decoder = c.value(QStringLiteral("decoder"), m_decoder).toInt();
     const bool lowLatency = c.value(QStringLiteral("lowLatency"), m_lowLatency).toBool();
     m_snapshotInterval = qBound(100, c.value(QStringLiteral("snapshotInterval"), m_snapshotInterval).toInt(), 3600000);
+    // Display-only settings: no stream restart needed.
+    setWebUrl(c.value(QStringLiteral("webUrl"), m_webUrl).toString());
+    setRotation(c.value(QStringLiteral("rotation"), m_rotation).toInt());
+    setFlipH(c.value(QStringLiteral("flipH"), m_flipH).toBool());
+    setFlipV(c.value(QStringLiteral("flipV"), m_flipV).toBool());
 
     const bool streamChanged = url != m_url || user != m_username || pass != m_password
                                || transport != m_transport || latency != m_latency
@@ -794,6 +905,7 @@ void Player::setStatus(Status s, const QString &text)
     m_status = s;
     m_statusText = t;
     Q_EMIT statusChanged();
+    updateHealth();
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +956,10 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
         g_object_set(sink, "widget", static_cast<gpointer>(m_glItem.data()), nullptr);
         gsu::setArg(sink, "sync", sync);
         gsu::setArg(sink, "enable-last-sample", QStringLiteral("false"));
+        if (GstPad *sp = gst_element_get_static_pad(sink, "sink")) {
+            gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->shown, nullptr);
+            gst_object_unref(sp);
+        }
         elems << up << conv << rgba << sink;
     } else {
         GstElement *conv = make("videoconvert");     // passthrough for NV12/I420
@@ -1326,10 +1442,11 @@ void Player::teardown(bool synchronous)
 {
     m_watchdog.stop();
     stopNetworkSources();
-    if (m_fps != 0) {
-        m_fps = 0;
-        Q_EMIT statsChanged();
-    }
+    m_fps = m_inFps = m_shownFps = m_frameAge = 0;
+    m_lastIn = m_lastShown = 0;
+    m_statsUs = 0;
+    m_qtShown = 0;
+    Q_EMIT statsChanged();
     if (!m_pipeline)
         return;
     ++m_gen;   // events already queued by the old pipeline become stale
@@ -1370,6 +1487,7 @@ void Player::onTeardownDone()
 
 void Player::scheduleRetry(const QString &reason)
 {
+    m_lastReconnectMs = QDateTime::currentMSecsSinceEpoch();
     QString text = reason;
     int delay = qMin(30000, 1000 << qMin(m_retry, 5));
     const bool decoderStage = m_ctx && m_ctx->linked;
@@ -1397,14 +1515,34 @@ void Player::onWatchdog()
 {
     if (!m_ctx)
         return;
+    // Rates use the real elapsed time: the GUI thread may be late when the
+    // system is overloaded, a fixed 1 s period would overstate the rates.
+    const qint64 nowUs = g_get_monotonic_time();
+    const qreal dt = m_statsUs > 0 ? qMax(0.2, qreal(nowUs - m_statsUs) / 1e6) : 1.0;
+    m_statsUs = nowUs;
+    auto ema = [dt](qreal old, quint64 delta) {
+        const qreal rate = qreal(delta) / dt;
+        return old <= 0 ? rate : old * 0.5 + rate * 0.5;
+    };
     const quint64 frames = m_ctx->frames.load(std::memory_order_relaxed);
     const quint64 delta = frames - m_lastFrames;
     m_lastFrames = frames;
-    const qreal fps = m_fps <= 0 ? qreal(delta) : m_fps * 0.5 + qreal(delta) * 0.5;
-    if (qAbs(fps - m_fps) > 0.05) {
-        m_fps = fps;
-        Q_EMIT statsChanged();
-    }
+    m_fps = ema(m_fps, delta);
+    const quint64 in = m_ctx->hasDecoderProbe ? m_ctx->inFrames.load(std::memory_order_relaxed) : frames;
+    m_inFps = ema(m_inFps, in - m_lastIn);
+    m_lastIn = in;
+    const quint64 shown = m_ctx->glSink ? m_ctx->shown.load(std::memory_order_relaxed)
+                                        : m_qtShown.load(std::memory_order_relaxed);
+    m_shownFps = ema(m_shownFps, shown - m_lastShown);
+    m_lastShown = shown;
+    const qint64 last = m_ctx->lastFrameUs.load(std::memory_order_relaxed);
+    m_frameAge = last > 0 ? qreal(g_get_monotonic_time() - last) / 1e6 : 0;
+    updateHealth();
+    static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
+    if (debugStats)
+        qInfo("[%s] in %.1f dec %.1f shown %.1f render %.1f nominal %.1f age %.2f | %s", qPrintable(m_name),
+              m_inFps, m_fps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge, qPrintable(m_healthText));
+
     if (m_status == Playing) {
         m_stallTicks = delta == 0 ? m_stallTicks + 1 : 0;
         if (m_stallTicks >= m_stallLimit)
@@ -1413,6 +1551,75 @@ void Player::onWatchdog()
         if (++m_connectTicks >= qMax(25, m_stallLimit))
             scheduleRetry(QStringLiteral("Таймаут подключения"));
     }
+}
+
+// Traffic light. Compares what the source delivers, what the decoder
+// produces and what reaches the screen, so the operator sees where the
+// problem is (network/camera, decoder, or display/GPU).
+void Player::updateHealth()
+{
+    int h = HealthNone;
+    QString t;
+    auto f1 = [](qreal v) { return QString::number(v, 'f', v < 10 ? 1 : 0); };
+    switch (m_status) {
+    case Stopped:
+    case Suspended:
+        break;
+    case Connecting:
+        h = HealthWarning;
+        t = QStringLiteral("Подключение к источнику…");
+        break;
+    case Reconnecting:
+        h = HealthBad;
+        t = QStringLiteral("Нет видеопотока");
+        break;
+    case Playing: {
+        // Reference rate: what the stream declares, otherwise what arrives.
+        const qreal ref = m_nominalFps > 0 ? m_nominalFps : qMax(m_inFps, m_fps);
+        qreal shown = m_shownFps;
+        if (m_renderFps >= 0 && m_renderFps < shown)
+            shown = m_renderFps;      // the window repaints less often than frames arrive
+        const qreal period = ref > 0.1 ? 1.0 / ref : 1.0;
+        const qreal yellowAge = qMax(1.0, 2.5 * period);
+        const qreal redAge = qMax(3.0, 6.0 * period);
+        const bool recent = m_lastReconnectMs > 0
+                            && QDateTime::currentMSecsSinceEpoch() - m_lastReconnectMs < 30000;
+        h = HealthGood;
+        t = QStringLiteral("Видеопоток в норме: %1 к/с").arg(f1(shown));
+        if (m_frameAge >= redAge) {
+            h = HealthBad;
+            t = QStringLiteral("Нет новых кадров %1 с").arg(f1(m_frameAge));
+        } else if (ref >= 2 && shown < 0.3 * ref) {
+            h = HealthBad;
+            t = m_fps >= 0.8 * m_inFps
+                    ? QStringLiteral("Отображение не успевает: %1 из %2 к/с (перегружен GPU/вывод)").arg(f1(shown), f1(ref))
+                    : QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(m_inFps));
+        } else if (ref >= 2 && shown < 0.8 * ref) {
+            h = HealthWarning;
+            t = m_fps < 0.8 * m_inFps
+                    ? QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(m_inFps))
+                    : QStringLiteral("Отображение пропускает кадры: %1 из %2 к/с").arg(f1(shown), f1(ref));
+        } else if (m_nominalFps > 0 && m_inFps < 0.6 * m_nominalFps) {
+            h = HealthWarning;
+            t = QStringLiteral("Источник присылает мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(m_nominalFps));
+        } else if (m_frameAge >= yellowAge) {
+            h = HealthWarning;
+            t = QStringLiteral("Перебои: кадра не было %1 с").arg(f1(m_frameAge));
+        } else if (recent) {
+            h = HealthWarning;
+            t = QStringLiteral("Недавно было переподключение");
+        } else if (m_hwFailed && m_decoder == DecoderAuto) {
+            h = HealthWarning;
+            t = QStringLiteral("Аппаратный декодер не справился, работает программный");
+        }
+        break;
+    }
+    }
+    if (h != m_health || t != m_healthText) {
+        m_health = h;
+        m_healthText = t;
+    }
+    Q_EMIT statsChanged();
 }
 
 // Short Russian explanation for the most common GStreamer errors.
@@ -1454,10 +1661,11 @@ void Player::onDecoderSelected(quint64 gen, const QString &codec, const QString 
     Q_EMIT videoInfoChanged();
 }
 
-void Player::onVideoSize(quint64 gen, int w, int h, int parN, int parD)
+void Player::onVideoSize(quint64 gen, int w, int h, int parN, int parD, int fpsN, int fpsD)
 {
     if (gen != m_gen || w <= 0 || h <= 0)
         return;
+    m_nominalFps = (fpsN > 0 && fpsD > 0) ? qreal(fpsN) / fpsD : 0;
     if (parN > 0 && parD > 0 && parN != parD)
         w = int(qint64(w) * parN / parD);
     if (w == m_videoWidth && h == m_videoHeight)
@@ -1465,7 +1673,7 @@ void Player::onVideoSize(quint64 gen, int w, int h, int parN, int parD)
     const qreal oldAspect = aspect();
     m_videoWidth = w;
     m_videoHeight = h;
-    m_savedAspect = aspect();
+    m_savedAspect = videoAspect();
     Q_EMIT videoInfoChanged();
     if (!qFuzzyCompare(oldAspect, aspect())) {
         Q_EMIT geometryChanged();
@@ -1575,6 +1783,8 @@ void Player::flushFrame()
         m_latestFrame = QVideoFrame();
         m_framePosted = false;
     }
-    if (m_videoSink && f.isValid())
+    if (m_videoSink && f.isValid()) {
         m_videoSink->setVideoFrame(f);
+        m_qtShown.fetch_add(1, std::memory_order_relaxed);
+    }
 }

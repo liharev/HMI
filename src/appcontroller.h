@@ -1,11 +1,15 @@
 // Application controller: windows, persistence, screens, single instance IPC.
 #pragma once
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QTimer>
 #include <QVariantList>
+
+#include <atomic>
+#include <memory>
 
 class QQmlEngine;
 class QQmlComponent;
@@ -23,6 +27,10 @@ class AppController : public QObject
     Q_PROPERTY(QString hardwareDecoders READ hardwareDecoders CONSTANT)
     Q_PROPERTY(QString version READ version CONSTANT)
     Q_PROPERTY(QString configPath READ configPath CONSTANT)
+    Q_PROPERTY(QString productName READ productName CONSTANT)
+    Q_PROPERTY(QString glRenderer READ glRenderer NOTIFY glInfoChanged)
+    Q_PROPERTY(bool softwareRendering READ softwareRendering NOTIFY glInfoChanged)
+    Q_PROPERTY(QVariantList builtinWallpapers READ builtinWallpapers CONSTANT)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -35,6 +43,10 @@ public:
     QString hardwareDecoders() const;
     QString version() const;
     QString configPath() const { return m_configPath; }
+    QString productName() const { return QStringLiteral("CAMAI VMS"); }
+    QString glRenderer() const { return m_glRenderer; }
+    bool softwareRendering() const;
+    QVariantList builtinWallpapers() const;
 
     void load();
     bool listen(const QString &serverName);
@@ -53,6 +65,7 @@ public:
 Q_SIGNALS:
     void windowsChanged();
     void screensChanged();
+    void glInfoChanged();
 
 private:
     void addWindow(VmsWindow *w);
@@ -70,6 +83,10 @@ private:
     QList<VmsWindow *> m_windows;
     QHash<VmsWindow *, QPointer<QQuickWindow>> m_views;
     QTimer m_saveTimer;
+    QTimer m_fpsTimer;
+    QElapsedTimer m_fpsClock;
+    QHash<VmsWindow *, std::shared_ptr<std::atomic<int>>> m_frameCounters;
+    QString m_glRenderer;
     QLocalServer *m_server = nullptr;
     bool m_quitting = false;
 };

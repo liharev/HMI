@@ -13,6 +13,8 @@ Item {
     property Flickable viewport
 
     readonly property bool flowMode: win.layoutMode === VmsWindow.Flow
+    readonly property bool gridMode: win.layoutMode === VmsWindow.Grid
+    readonly property bool freeMode: win.layoutMode === VmsWindow.Free
     readonly property bool expanded: view && view.expandedTile === tile
     property bool dragging: false
     property bool resizing: false
@@ -26,15 +28,16 @@ Item {
     readonly property real expH: expW / player.aspect
 
     x: expanded ? viewport.contentX + (viewport.width - expW) / 2
-       : dragging ? dragX : (flowMode ? player.layoutX : player.posX)
+       : dragging ? dragX : (freeMode ? player.posX : player.layoutX)
     y: expanded ? viewport.contentY + (viewport.height - expH) / 2
-       : dragging ? dragY : (flowMode ? player.layoutY : player.posY)
-    width: expanded ? expW : player.displayWidth
-    height: expanded ? expH : player.displayHeight
+       : dragging ? dragY : (freeMode ? player.posY : player.layoutY)
+    // Grid: every player takes a whole cell (video letterboxed inside).
+    width: expanded ? expW : (gridMode ? player.layoutWidth : player.displayWidth)
+    height: expanded ? expH : (gridMode ? player.layoutHeight : player.displayHeight)
     z: expanded ? 6000 : (dragging ? 3000 : zOrder)
 
-    Behavior on x { enabled: tile.flowMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
-    Behavior on y { enabled: tile.flowMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+    Behavior on x { enabled: !tile.freeMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+    Behavior on y { enabled: !tile.freeMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
 
     readonly property color statusColor: {
         switch (player.status) {
@@ -64,7 +67,27 @@ Item {
 
     // ---------------------------------------------------------------- video
     Rectangle { anchors.fill: parent; color: "black" }
-    Item { id: surfaceHolder; anchors.fill: parent }
+    // Orientation: mirroring in screen coordinates (outer item), rotation
+    // inside; both are GPU transforms of the video surface (no CPU cost).
+    Item {
+        id: flipper
+        anchors.fill: parent
+        clip: true
+        transform: Scale {
+            origin.x: flipper.width / 2
+            origin.y: flipper.height / 2
+            xScale: tile.player.flipH ? -1 : 1
+            yScale: tile.player.flipV ? -1 : 1
+        }
+        Item {
+            id: surfaceHolder
+            readonly property bool swap: tile.player.rotation % 180 === 90
+            anchors.centerIn: parent
+            width: swap ? flipper.height : flipper.width
+            height: swap ? flipper.width : flipper.height
+            rotation: tile.player.rotation
+        }
+    }
 
     Component {
         id: qtSurfaceComponent
@@ -103,6 +126,7 @@ Item {
     WheelHandler {
         target: null
         acceptedModifiers: Qt.ControlModifier
+        enabled: !tile.gridMode
         onWheel: (ev) => {
             const f = ev.angleDelta.y > 0 ? 1.1 : 1 / 1.1
             tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * f)
@@ -176,6 +200,64 @@ Item {
         styleColor: "black"
         font.pixelSize: 12
         elide: Text.ElideRight
+    }
+
+    // Traffic light: green - OK, yellow - problems, red - no video / unusable.
+    readonly property color healthColor: player.health === Player.HealthGood ? "#22c55e"
+                                       : player.health === Player.HealthWarning ? "#eab308"
+                                       : player.health === Player.HealthBad ? "#ef4444" : "#6b7280"
+    readonly property real refFps: player.nominalFps > 0 ? player.nominalFps : Math.max(player.inFps, player.fps)
+    Rectangle {
+        id: healthPill
+        visible: tile.player.health !== Player.HealthNone
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.rightMargin: 6
+        anchors.topMargin: bar.visible ? bar.height + 4 : 6
+        height: 20
+        radius: 10
+        width: healthRow.implicitWidth + 12
+        color: "#a6000000"
+        border.color: Qt.rgba(tile.healthColor.r, tile.healthColor.g, tile.healthColor.b, 0.7)
+        border.width: 1
+        z: 10
+        Row {
+            id: healthRow
+            anchors.centerIn: parent
+            spacing: 5
+            Rectangle {
+                width: 10; height: 10; radius: 5
+                anchors.verticalCenter: parent.verticalCenter
+                color: tile.healthColor
+            }
+            Text {
+                visible: tile.width >= 220
+                anchors.verticalCenter: parent.verticalCenter
+                color: "white"
+                font.pixelSize: 11
+                text: {
+                    const p = tile.player
+                    if (p.status === Player.Playing) {
+                        // What the operator really sees: limited by the window repaint rate.
+                        const r = tile.win.renderFps
+                        const shown = Math.round(r >= 0 ? Math.min(p.shownFps, r) : p.shownFps)
+                        return tile.refFps > 0 ? shown + "/" + Math.round(tile.refFps) + " к/с" : shown + " к/с"
+                    }
+                    if (p.status === Player.Connecting) return "подключение"
+                    return "нет видео"
+                }
+            }
+        }
+        HoverHandler { id: healthHover }
+        ToolTip.visible: healthHover.hovered
+        ToolTip.delay: 300
+        ToolTip.text: tile.player.healthText
+                      + (tile.player.status === Player.Playing
+                         ? "\nприём " + tile.player.inFps.toFixed(1) + " · декодирование " + tile.player.fps.toFixed(1)
+                           + " · показ " + tile.player.shownFps.toFixed(1)
+                           + " · перерисовка окна " + Math.max(0, tile.win.renderFps).toFixed(1) + " к/с"
+                           + (tile.player.nominalFps > 0 ? " (номинал " + tile.player.nominalFps.toFixed(1) + ")" : "")
+                         : "")
     }
 
     // Frame: status colour, highlighted while hovered.
@@ -281,7 +363,7 @@ Item {
                     let s = (p.sourceType ? p.sourceType + " · " : "") + p.codec
                     if (p.videoWidth > 0)
                         s += "  " + p.videoWidth + "×" + p.videoHeight
-                    s += "  " + p.fps.toFixed(0) + " к/с"
+                    s += "  " + p.shownFps.toFixed(0) + " к/с"
                     if (p.decoderName)
                         s += "  " + (p.hardwareDecoding ? "HW " : "SW ") + p.decoderName
                     return s
@@ -307,6 +389,7 @@ Item {
             }
             ToolIconButton {
                 text: "1:1"
+                enabled: !tile.gridMode
                 font.pixelSize: 11
                 tip: "Оригинальный размер" + (tile.player.videoWidth > 0
                      ? " (" + tile.player.videoWidth + "×" + tile.player.videoHeight + ")" : "")
@@ -332,7 +415,7 @@ Item {
         width: 22; height: 22
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        visible: !tile.expanded
+        visible: !tile.expanded && !tile.gridMode
         cursorShape: Qt.SizeFDiagCursor
         preventStealing: true
         hoverEnabled: true
@@ -382,17 +465,50 @@ Item {
     // ---------------------------------------------------------------- menus
     Menu {
         id: contextMenu
-        width: 260
+        width: tile.view.em * 17
         MenuItem {
             text: tile.player.active ? "Остановить" : "Запустить"
             onTriggered: tile.player.active ? tile.player.stop() : tile.player.start()
         }
         MenuItem { text: "Переподключить"; onTriggered: tile.player.restart() }
+        MenuItem {
+            text: "Веб-интерфейс камеры…"
+            // Inactive (dimmed) until the address is set in the player settings.
+            enabled: tile.player.webUrl.length > 0
+            onTriggered: Qt.openUrlExternally(tile.player.webPageUrl())
+        }
         MenuSeparator {}
-        MenuItem { text: "Оригинальный размер"; onTriggered: { tile.view.expandedTile = null; tile.player.resetSize() } }
+        Menu {
+            title: "Поворот и отражение"
+            width: tile.view.em * 17
+            MenuItem { text: "Повернуть по часовой (90°)"; onTriggered: tile.player.rotateBy(90) }
+            MenuItem { text: "Повернуть против часовой (90°)"; onTriggered: tile.player.rotateBy(-90) }
+            MenuItem { text: "Повернуть на 180°"; onTriggered: tile.player.rotateBy(180) }
+            MenuSeparator {}
+            MenuItem {
+                text: "Отразить по горизонтали"
+                checkable: true
+                checked: tile.player.flipH
+                onTriggered: tile.player.flipH = checked
+            }
+            MenuItem {
+                text: "Отразить по вертикали"
+                checkable: true
+                checked: tile.player.flipV
+                onTriggered: tile.player.flipV = checked
+            }
+            MenuSeparator {}
+            MenuItem {
+                text: "Сбросить (" + tile.player.rotation + "°)"
+                enabled: tile.player.rotation !== 0 || tile.player.flipH || tile.player.flipV
+                onTriggered: tile.player.resetOrientation()
+            }
+        }
+        MenuSeparator {}
+        MenuItem { text: "Оригинальный размер"; enabled: !tile.gridMode; onTriggered: { tile.view.expandedTile = null; tile.player.resetSize() } }
         MenuItem { text: tile.expanded ? "Свернуть" : "Развернуть в окне"; onTriggered: tile.view.expandedTile = tile.expanded ? null : tile }
-        MenuItem { text: "Увеличить (+25%)"; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 1.25) }
-        MenuItem { text: "Уменьшить (−20%)"; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 0.8) }
+        MenuItem { text: "Увеличить (+25%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 1.25) }
+        MenuItem { text: "Уменьшить (−20%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 0.8) }
         MenuSeparator {}
         MenuItem { text: "Переместить в начало"; onTriggered: tile.win.movePlayer(tile.player, 0) }
         MenuItem { text: "Переместить в конец"; onTriggered: tile.win.movePlayer(tile.player, tile.win.playerCount) }

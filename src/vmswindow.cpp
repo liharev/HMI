@@ -68,7 +68,12 @@ VmsWindow *VmsWindow::fromJson(const QJsonObject &o, QObject *parent)
     const QColor c(o.value(QLatin1String("color")).toString());
     if (c.isValid())
         w->m_color = c;
-    w->m_layoutMode = o.value(QLatin1String("layoutMode")).toInt(Flow) == Free ? Free : Flow;
+    const int mode = o.value(QLatin1String("layoutMode")).toInt(Flow);
+    w->m_layoutMode = (mode == Free || mode == Grid) ? mode : Flow;
+    w->m_gridRows = qBound(1, o.value(QLatin1String("gridRows")).toInt(2), 16);
+    w->m_gridCols = qBound(1, o.value(QLatin1String("gridCols")).toInt(2), 16);
+    w->m_wallpaper = o.value(QLatin1String("wallpaper")).toString();
+    w->m_wallpaperDim = qBound(0.0, o.value(QLatin1String("wallpaperDim")).toDouble(0.0), 0.95);
     w->m_open = o.value(QLatin1String("open")).toBool(true);
     w->m_sortKey = o.value(QLatin1String("sortKey")).toString();
     w->m_sortAsc = o.value(QLatin1String("sortAscending")).toBool(true);
@@ -93,6 +98,10 @@ QJsonObject VmsWindow::toJson() const
     o.insert(QLatin1String("title"), m_title);
     o.insert(QLatin1String("color"), m_color.name(QColor::HexRgb));
     o.insert(QLatin1String("layoutMode"), m_layoutMode);
+    o.insert(QLatin1String("gridRows"), m_gridRows);
+    o.insert(QLatin1String("gridCols"), m_gridCols);
+    o.insert(QLatin1String("wallpaper"), m_wallpaper);
+    o.insert(QLatin1String("wallpaperDim"), m_wallpaperDim);
     o.insert(QLatin1String("open"), m_open);
     o.insert(QLatin1String("sortKey"), m_sortKey);
     o.insert(QLatin1String("sortAscending"), m_sortAsc);
@@ -130,9 +139,17 @@ void VmsWindow::setColor(const QColor &c)
 
 void VmsWindow::setLayoutMode(int m)
 {
-    m = (m == Free) ? Free : Flow;
+    m = (m == Free || m == Grid) ? m : Flow;
     if (m == m_layoutMode)
         return;
+    if (m_layoutMode == Grid) {
+        // Leaving the grid: keep the size the video had in its cell.
+        for (Player *p : m_players.items()) {
+            if (p->layoutWidth() > 0 && p->layoutHeight() > 0)
+                p->setDisplayWidth(qMin(p->layoutWidth(), p->layoutHeight() * p->aspect()));
+        }
+        relayout();
+    }
     if (m == Free) {
         // Start free mode exactly where the flow layout put the players.
         for (Player *p : m_players.items()) {
@@ -144,6 +161,55 @@ void VmsWindow::setLayoutMode(int m)
     Q_EMIT layoutModeChanged();
     Q_EMIT changed();
     relayout();
+}
+
+void VmsWindow::setGrid(int rows, int cols)
+{
+    rows = qBound(1, rows, 16);
+    cols = qBound(1, cols, 16);
+    if (rows != m_gridRows || cols != m_gridCols) {
+        m_gridRows = rows;
+        m_gridCols = cols;
+        Q_EMIT gridChanged();
+        Q_EMIT changed();
+    }
+    if (m_layoutMode != Grid)
+        setLayoutMode(Grid);
+    relayout();
+}
+
+QPointF VmsWindow::cellPos(int index) const
+{
+    const int r = index / m_gridCols;
+    const int col = index % m_gridCols;
+    return QPointF(kMargin + col * (m_cellW + kSpacing), kMargin + r * (m_cellH + kSpacing));
+}
+
+void VmsWindow::setWallpaper(const QString &w)
+{
+    if (w == m_wallpaper)
+        return;
+    m_wallpaper = w;
+    Q_EMIT wallpaperChanged();
+    Q_EMIT changed();
+}
+
+void VmsWindow::setWallpaperDim(qreal d)
+{
+    d = qBound(0.0, d, 0.95);
+    if (qFuzzyCompare(d + 1, m_wallpaperDim + 1))
+        return;
+    m_wallpaperDim = d;
+    Q_EMIT wallpaperChanged();
+    Q_EMIT changed();
+}
+
+void VmsWindow::setRenderFps(qreal fps)
+{
+    m_renderFps = fps;
+    for (Player *p : m_players.items())
+        p->setRenderFps(fps);
+    Q_EMIT renderFpsChanged();
 }
 
 void VmsWindow::setOpen(bool o)
@@ -308,7 +374,7 @@ int VmsWindow::dropIndex(Player *dragged, qreal x, qreal y) const
     qreal bestDist = 0;
     for (int i = 0; i < list.size(); ++i) {
         const Player *p = list[i];
-        const QRectF r(p->layoutX(), p->layoutY(), p->displayWidth(), p->displayHeight());
+        const QRectF r(p->layoutX(), p->layoutY(), p->layoutWidth(), p->layoutHeight());
         if (r.contains(x, y))
             return x < r.center().x() ? i : i + 1;
         // Distance to the rectangle, rows weighted stronger than columns.
@@ -321,7 +387,7 @@ int VmsWindow::dropIndex(Player *dragged, qreal x, qreal y) const
         }
     }
     const Player *p = list[best];
-    return x < p->layoutX() + p->displayWidth() / 2 ? best : best + 1;
+    return x < p->layoutX() + p->layoutWidth() / 2 ? best : best + 1;
 }
 
 QRectF VmsWindow::dropIndicator(Player *dragged, qreal x, qreal y) const
@@ -333,10 +399,10 @@ QRectF VmsWindow::dropIndicator(Player *dragged, qreal x, qreal y) const
     const int idx = dropIndex(dragged, x, y);
     if (idx < list.size()) {
         const Player *p = list[idx];
-        return QRectF(p->layoutX() - kSpacing / 2 - 2, p->layoutY(), 4, p->displayHeight());
+        return QRectF(p->layoutX() - kSpacing / 2 - 2, p->layoutY(), 4, p->layoutHeight());
     }
     const Player *p = list.last();
-    return QRectF(p->layoutX() + p->displayWidth() + kSpacing / 2 - 2, p->layoutY(), 4, p->displayHeight());
+    return QRectF(p->layoutX() + p->layoutWidth() + kSpacing / 2 - 2, p->layoutY(), 4, p->layoutHeight());
 }
 
 void VmsWindow::sortBy(const QString &key, bool ascending)
@@ -383,6 +449,8 @@ void VmsWindow::applySort()
 
 void VmsWindow::fitAll()
 {
+    if (m_layoutMode == Grid)
+        return;          // the grid always fills the window
     const QList<Player *> list = ordered();
     const int n = list.size();
     if (n == 0)
@@ -411,6 +479,8 @@ void VmsWindow::fitAll()
 
 void VmsWindow::originalSizeAll()
 {
+    if (m_layoutMode == Grid)
+        setLayoutMode(Flow);   // native sizes are meaningless in fixed cells
     for (Player *p : m_players.items())
         p->resetSize();
     relayout();
@@ -457,6 +527,24 @@ void VmsWindow::scheduleRelayout()
 void VmsWindow::relayout()
 {
     m_relayoutQueued = false;
+    if (m_layoutMode == Grid) {
+        // Equal cells; N rows fill the viewport, further players continue
+        // on additional rows (scrolling).
+        const qreal cw = qMax<qreal>(40, (m_viewportW - 2 * kMargin - (m_gridCols - 1) * kSpacing) / m_gridCols);
+        const qreal ch = qMax<qreal>(30, (m_viewportH - 2 * kMargin - (m_gridRows - 1) * kSpacing) / m_gridRows);
+        m_cellW = cw;
+        m_cellH = ch;
+        const QList<Player *> list = ordered();
+        for (int i = 0; i < list.size(); ++i) {
+            const QPointF pos = cellPos(i);
+            list[i]->setLayoutRect(pos.x(), pos.y(), cw, ch);
+        }
+        const int rowsUsed = qMax(m_gridRows, int((list.size() + m_gridCols - 1) / m_gridCols));
+        m_contentW = m_viewportW;
+        m_contentH = 2 * kMargin + rowsUsed * ch + (rowsUsed - 1) * kSpacing;
+        Q_EMIT contentSizeChanged();
+        return;
+    }
     // Flow layout: left to right, wrap at the viewport edge. Always computed:
     // it is also the target of drag & drop and of "arrange" in free mode.
     qreal x = kMargin, y = kMargin, rowH = 0, right = 0;
@@ -469,7 +557,7 @@ void VmsWindow::relayout()
             y += rowH + kSpacing;
             rowH = 0;
         }
-        p->setLayoutPos(x, y);
+        p->setLayoutRect(x, y, w, h);
         x += w + kSpacing;
         rowH = qMax(rowH, h);
         right = qMax(right, x - kSpacing);

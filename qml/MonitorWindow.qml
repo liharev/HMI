@@ -13,10 +13,16 @@ ApplicationWindow {
     readonly property color accentText: (0.299 * accent.r + 0.587 * accent.g + 0.114 * accent.b) > 0.62
                                         ? "#111111" : "#ffffff"
     readonly property bool flowMode: win && win.layoutMode === VmsWindow.Flow
+    readonly property bool gridMode: win && win.layoutMode === VmsWindow.Grid
+    readonly property bool freeMode: win && win.layoutMode === VmsWindow.Free
+    // Size unit derived from the system font: dialogs and menus scale with it.
+    readonly property real em: fontMetrics.height
+    FontMetrics { id: fontMetrics; font: root.font }
+    property bool renderWarningClosed: false
     property int zCounter: 1
     property var expandedTile: null
 
-    title: win ? win.title : "HMI VMS"
+    title: win ? win.title : App.productName
     color: "#0e1013"
 
     // Dark theme for all controls, menus and dialogs of this window.
@@ -37,6 +43,10 @@ ApplicationWindow {
     palette.toolTipBase: "#2a2e34"
     palette.toolTipText: "#e6e6e6"
     palette.placeholderText: "#80868e"
+    palette.disabled.text: "#6b7078"
+    palette.disabled.windowText: "#6b7078"
+    palette.disabled.buttonText: "#6b7078"
+    palette.disabled.highlightedText: "#9ca3af"
     minimumWidth: 480
     minimumHeight: 320
 
@@ -81,7 +91,7 @@ ApplicationWindow {
     // ------------------------------------------------------------------ header
     header: ToolBar {
         id: toolbar
-        height: 40
+        height: Math.max(40, Math.round(root.em * 2.3))
         palette.buttonText: root.accentText
         palette.windowText: root.accentText
         background: Rectangle {
@@ -112,10 +122,10 @@ ApplicationWindow {
             }
             Label {
                 text: root.win ? root.win.title : ""
-                font.pixelSize: 16
+                font.pixelSize: Math.round(root.em * 0.95)
                 font.bold: true
                 elide: Text.ElideRight
-                Layout.maximumWidth: 360
+                Layout.maximumWidth: root.em * 20
                 MouseArea {
                     anchors.fill: parent
                     onDoubleClicked: windowDialog.open()
@@ -145,9 +155,17 @@ ApplicationWindow {
             HeaderButton {
                 fg: root.accentText
                 text: "Свободно"
-                checked: !root.flowMode
+                checked: root.freeMode
                 onClicked: root.win.layoutMode = VmsWindow.Free
                 tip: "Плееры размещаются в любом месте окна"
+            }
+            HeaderButton {
+                id: gridButton
+                fg: root.accentText
+                text: "Сетка " + root.win.gridRows + "×" + root.win.gridCols + " ▾"
+                checked: root.gridMode
+                onClicked: gridPopup.open()
+                tip: "Все плееры одного размера в сетке N строк × M столбцов на всё окно"
             }
             Rectangle { width: 1; height: 20; color: root.accentText; opacity: 0.35; Layout.leftMargin: 4; Layout.rightMargin: 4 }
             HeaderButton {
@@ -170,9 +188,68 @@ ApplicationWindow {
     }
 
     // ------------------------------------------------------------------ menus
+    Popup {
+        id: gridPopup
+        parent: gridButton
+        y: gridButton.height + 2
+        x: Math.min(0, root.width - width - gridButton.mapToItem(null, 0, 0).x - 8)
+        padding: Math.round(root.em * 0.6)
+        modal: false
+        focus: true
+        onAboutToShow: {
+            rowsSpin.value = root.win.gridRows
+            colsSpin.value = root.win.gridCols
+        }
+        contentItem: ColumnLayout {
+            spacing: Math.round(root.em * 0.4)
+            Label { text: "Сетка: строк × столбцов"; font.bold: true }
+            GridLayout {
+                columns: 4
+                rowSpacing: 4
+                columnSpacing: 4
+                Repeater {
+                    model: [[1, 1], [1, 2], [2, 2], [2, 3], [3, 3], [3, 4], [4, 4], [4, 5], [5, 5], [4, 6], [6, 6], [8, 8]]
+                    delegate: Button {
+                        required property var modelData
+                        text: modelData[0] + " × " + modelData[1]
+                        Layout.fillWidth: true
+                        highlighted: root.gridMode && root.win.gridRows === modelData[0] && root.win.gridCols === modelData[1]
+                        onClicked: {
+                            root.win.setGrid(modelData[0], modelData[1])
+                            gridPopup.close()
+                        }
+                    }
+                }
+            }
+            RowLayout {
+                spacing: 6
+                Label { text: "Строк" }
+                SpinBox { id: rowsSpin; from: 1; to: 16; editable: true }
+                Label { text: "Столбцов" }
+                SpinBox { id: colsSpin; from: 1; to: 16; editable: true }
+            }
+            Button {
+                text: "Применить " + rowsSpin.value + " × " + colsSpin.value
+                Layout.alignment: Qt.AlignRight
+                onClicked: {
+                    root.win.setGrid(rowsSpin.value, colsSpin.value)
+                    gridPopup.close()
+                }
+            }
+            Label {
+                Layout.maximumWidth: root.em * 22
+                wrapMode: Text.Wrap
+                opacity: 0.65
+                font.pixelSize: Math.round(root.em * 0.68)
+                text: "Плееры заполняют ячейки по порядку (порядок меняется перетаскиванием и сортировкой); "
+                      + "если плееров больше, чем ячеек, они продолжаются ниже с прокруткой."
+            }
+        }
+    }
+
     Menu {
         id: sortMenu
-        width: 400
+        width: root.em * 24
         MenuItem { text: "По имени (А → Я)"; onTriggered: root.win.sortBy("name", true) }
         MenuItem { text: "По имени (Я → А)"; onTriggered: root.win.sortBy("name", false) }
         MenuItem { text: "По адресу потока"; onTriggered: root.win.sortBy("url", true) }
@@ -189,11 +266,11 @@ ApplicationWindow {
             onTriggered: root.win.autoSort = checked
         }
         MenuSeparator {}
-        MenuItem { text: "Уместить все в окне (сетка)\tCtrl+G"; onTriggered: root.win.fitAll() }
+        MenuItem { text: "Уместить все в окне\tCtrl+G"; enabled: !root.gridMode; onTriggered: root.win.fitAll() }
         MenuItem { text: "Оригинальный размер для всех"; onTriggered: root.win.originalSizeAll() }
         MenuItem {
             text: "Выстроить по порядку"
-            enabled: !root.flowMode
+            enabled: root.freeMode
             onTriggered: root.win.arrange()
         }
         MenuSeparator {}
@@ -205,7 +282,7 @@ ApplicationWindow {
 
     Menu {
         id: windowsMenu
-        width: 340
+        width: root.em * 20
         MenuItem { text: "Новое окно\tCtrl+N"; onTriggered: App.newWindow() }
         MenuSeparator {}
         Instantiator {
@@ -227,7 +304,7 @@ ApplicationWindow {
         MenuSeparator {}
         Menu {
             id: screenMenu
-            width: 360
+            width: root.em * 22
             title: "Переместить на экран"
             Instantiator {
                 model: App.screens
@@ -249,13 +326,13 @@ ApplicationWindow {
             onTriggered: App.toggleFullScreen(root.win)
         }
         MenuSeparator {}
-        MenuItem { text: "Название и цвет…"; onTriggered: windowDialog.open() }
+        MenuItem { text: "Название, цвет и обои…"; onTriggered: windowDialog.open() }
         MenuItem { text: "Удалить окно…"; onTriggered: deleteDialog.open() }
     }
 
     Menu {
         id: mainMenu
-        width: 260
+        width: root.em * 16
         MenuItem { text: "Запустить все плееры"; onTriggered: root.win.startAll() }
         MenuItem { text: "Остановить все плееры"; onTriggered: root.win.stopAll() }
         MenuSeparator {}
@@ -264,10 +341,29 @@ ApplicationWindow {
     }
 
     // ------------------------------------------------------------------ content
+    // Wallpaper (built-in CAMAI or a user image) with optional dimming.
+    Image {
+        id: wallpaperImage
+        anchors.fill: parent
+        source: root.win.wallpaper
+        visible: root.win.wallpaper.length > 0 && status === Image.Ready
+        fillMode: Image.PreserveAspectCrop
+        asynchronous: true
+        // Decode once at screen size: no reload while the window is resized.
+        sourceSize.width: root.screen ? root.screen.width : 1920
+    }
+    Rectangle {
+        anchors.fill: parent
+        color: "black"
+        opacity: root.win.wallpaperDim
+        visible: wallpaperImage.visible && opacity > 0
+    }
+
     Flickable {
         id: flick
         anchors.fill: parent
         anchors.margins: 3
+        anchors.topMargin: renderWarning.visible ? renderWarning.height + 3 : 3
         clip: true
         contentWidth: Math.max(width, root.win.contentWidth)
         contentHeight: Math.max(height, root.win.contentHeight)
@@ -298,6 +394,35 @@ ApplicationWindow {
                 MouseArea { anchors.fill: parent; onClicked: root.expandedTile = null }
             }
 
+            // Free cells of the grid: double click adds a camera.
+            Repeater {
+                model: root.gridMode ? Math.max(0, root.win.gridRows * root.win.gridCols - root.win.playerCount) : 0
+                delegate: Rectangle {
+                    required property int index
+                    readonly property point pos: {
+                        root.win.cellWidth; root.win.cellHeight; root.win.gridCols  // re-evaluate on change
+                        return root.win.cellPos(root.win.playerCount + index)
+                    }
+                    x: pos.x
+                    y: pos.y
+                    width: root.win.cellWidth
+                    height: root.win.cellHeight
+                    color: "#0affffff"
+                    border.color: "#22ffffff"
+                    radius: 2
+                    Label {
+                        anchors.centerIn: parent
+                        text: "＋"
+                        opacity: 0.25
+                        font.pixelSize: Math.min(parent.width, parent.height) * 0.18
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onDoubleClicked: playerDialog.openFor(null)
+                    }
+                }
+            }
+
             Repeater {
                 model: root.win.players
                 delegate: PlayerTile {
@@ -314,6 +439,38 @@ ApplicationWindow {
                 radius: 2
                 z: 4000
             }
+        }
+    }
+
+    // The UI is rendered without a GPU driver (llvmpipe): video will lag.
+    Rectangle {
+        id: renderWarning
+        visible: App.softwareRendering && !root.renderWarningClosed
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.margins: 3
+        height: warnText.implicitHeight + 14
+        color: "#e07f1d1d"
+        z: 20
+        Label {
+            id: warnText
+            anchors.left: parent.left
+            anchors.right: warnClose.left
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.margins: 8
+            wrapMode: Text.Wrap
+            color: "white"
+            text: "Графика работает без аппаратного ускорения (" + App.glRenderer + "). "
+                  + "Видео будет отображаться с пропусками кадров. Установите/включите драйвер GPU Mali "
+                  + "(Panfrost/Panthor или libmali) — см. раздел «Диагностика» в README."
+        }
+        ToolButton {
+            id: warnClose
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: "✕"
+            onClicked: root.renderWarningClosed = true
         }
     }
 
@@ -359,23 +516,43 @@ ApplicationWindow {
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        title: "HMI VMS " + App.version
-        width: Math.min(620, root.width - 40)
+        title: App.productName + " " + App.version
+        width: Math.min(root.em * 38, root.width - 40)
         footer: DialogButtonBox {
             Button { text: "Закрыть"; DialogButtonBox.buttonRole: DialogButtonBox.RejectRole }
         }
-        GridLayout {
+        contentItem: GridLayout {
             columns: 2
             columnSpacing: 12
             rowSpacing: 6
+            Label {
+                Layout.columnSpan: 2
+                text: App.productName + " — рабочее место администратора видеонаблюдения"
+                font.bold: true
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+            }
+            Label { text: "Версия:"; opacity: 0.7 }
+            Label { text: App.version; Layout.fillWidth: true }
             Label { text: "Вывод видео:"; opacity: 0.7 }
-            Label { text: App.renderBackend }
+            Label { text: App.renderBackend; wrapMode: Text.Wrap; Layout.fillWidth: true; Layout.preferredWidth: 1 }
+            Label { text: "Графика (GPU):"; opacity: 0.7 }
+            Label {
+                text: (App.glRenderer || "—") + (App.softwareRendering ? "  ⚠ без аппаратного ускорения" : "")
+                color: App.softwareRendering ? "#fca5a5" : palette.windowText
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+            }
             Label { text: "Аппаратные декодеры:"; opacity: 0.7 }
-            Label { text: App.hardwareDecoders; wrapMode: Text.Wrap; Layout.maximumWidth: 420 }
+            Label { text: App.hardwareDecoders; wrapMode: Text.Wrap; Layout.fillWidth: true; Layout.preferredWidth: 1 }
             Label { text: "Конфигурация:"; opacity: 0.7 }
-            Label { text: App.configPath; wrapMode: Text.WrapAnywhere; Layout.maximumWidth: 420 }
+            Label { text: App.configPath; wrapMode: Text.WrapAnywhere; Layout.fillWidth: true; Layout.preferredWidth: 1 }
             Label { text: "Экран окна:"; opacity: 0.7 }
-            Label { text: root.screen ? root.screen.name + " (" + root.screen.width + "×" + root.screen.height + ")" : "" }
+            Label {
+                text: root.screen ? root.screen.name + " (" + root.screen.width + "×" + root.screen.height + ")" : ""
+                Layout.fillWidth: true
+            }
         }
     }
 }
