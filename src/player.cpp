@@ -141,11 +141,12 @@ QVideoFrame sampleToFrame(GstSample *sample)
         return {};
 
     QVideoFrame frame(fmt);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
-    const bool mapped = frame.map(QtVideo::MapMode::WriteOnly);
-#else
+    // QVideoFrame::WriteOnly exists in every Qt 6 release (deprecated in
+    // newer ones in favour of QtVideo::MapMode, whose header varies).
+QT_WARNING_PUSH
+QT_WARNING_DISABLE_DEPRECATED
     const bool mapped = frame.map(QVideoFrame::WriteOnly);
-#endif
+QT_WARNING_POP
     if (!mapped) {
         gst_video_frame_unmap(&vf);
         return {};

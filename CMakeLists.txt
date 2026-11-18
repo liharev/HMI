@@ -16,6 +16,9 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
     gstreamer-1.0>=1.20 gstreamer-video-1.0>=1.20 gstreamer-app-1.0>=1.20)
 
 qt_standard_project_setup()
+if(QT_KNOWN_POLICY_QTP0004)
+    qt_policy(SET QTP0004 OLD)    # QML files live in qml/ without own qmldir
+endif()
 
 qt_add_executable(hmi-vms
     src/main.cpp
@@ -29,6 +32,7 @@ qt_add_qml_module(hmi-vms
     URI HmiUi
     VERSION 1.0
     RESOURCE_PREFIX /
+    NO_IMPORT_SCAN               # shared Qt: QML plugins are loaded at run time
     QML_FILES
         qml/MonitorWindow.qml
         qml/PlayerTile.qml
