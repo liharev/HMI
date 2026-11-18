@@ -38,6 +38,7 @@ Dialog {
         rotationBox.currentIndex = c.rotation !== undefined ? c.rotation / 90 : 0
         flipHCheck.checked = !!c.flipH
         flipVCheck.checked = !!c.flipV
+        outputBox.currentIndex = c.output !== undefined ? c.output : 0
         scroll.ScrollBar.vertical.position = 0
         open()
         urlField.forceActiveFocus()
@@ -58,7 +59,8 @@ Dialog {
             webUrl: webField.text.trim(),
             rotation: rotationBox.currentIndex * 90,
             flipH: flipHCheck.checked,
-            flipV: flipVCheck.checked
+            flipV: flipVCheck.checked,
+            output: outputBox.currentIndex
         }
         if (player)
             player.applyConfig(cfg)
@@ -216,6 +218,21 @@ Dialog {
                     text: "Минимальная задержка (выводить кадры сразу, без синхронизации по времени)"
                     MouseArea { anchors.fill: parent; onClicked: lowLatencyCheck.toggle() }
                 }
+            }
+
+            Label { text: "Вывод видео" }
+            ComboBox {
+                id: outputBox
+                Layout.fillWidth: true
+                Layout.preferredWidth: dlg.em * 4
+                model: ["Авто (подбирается по скорости)", "GPU без копирования (zero-copy)",
+                        "GPU с копированием кадра", "Qt Multimedia"]
+            }
+            Item { implicitWidth: 1; implicitHeight: 1 }
+            Hint {
+                text: (dlg.player ? "Сейчас: " + dlg.player.renderPath + ". " : "")
+                      + "В режиме «Авто» плеер сам переходит на другой способ, если кадры не успевают "
+                      + "попадать на экран, и запоминает его."
             }
 
             Section { text: "Изображение" }

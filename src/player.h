@@ -74,6 +74,12 @@ class Player : public QObject
     // Traffic light: -1 none (stopped), 0 green, 1 yellow, 2 red.
     Q_PROPERTY(int health READ health NOTIFY statsChanged)
     Q_PROPERTY(QString healthText READ healthText NOTIFY statsChanged)
+    // Output path: false - GStreamer GL (zero-copy), true - Qt Multimedia.
+    // Switched automatically when the GL upload cannot keep up.
+    Q_PROPERTY(bool useQtSink READ useQtSink NOTIFY renderPathChanged)
+    // 0 auto (learned), 1 GL zero-copy, 2 GL with copy, 3 Qt Multimedia
+    Q_PROPERTY(int output READ output NOTIFY renderPathChanged)
+    Q_PROPERTY(QString renderPath READ renderPath NOTIFY renderPathChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -166,6 +172,11 @@ public:
     QString healthText() const { return m_healthText; }
     // Frames/s the window actually renders (measured by the window).
     void setRenderFps(qreal fps) { m_renderFps = fps; }
+    bool useQtSink() const;
+    int output() const { return m_output; }
+    enum Output { OutputAuto, OutputGl, OutputGlCopy, OutputQt };
+    Q_ENUM(Output)
+    QString renderPath() const;
 
     Q_INVOKABLE QVariantMap config() const;
     Q_INVOKABLE void applyConfig(const QVariantMap &cfg);
@@ -193,6 +204,7 @@ Q_SIGNALS:
     void posChanged();
     void layoutChanged();
     void orientationChanged();
+    void renderPathChanged();
     void orderChanged();
     void statusChanged();
     void videoInfoChanged();
@@ -221,6 +233,8 @@ private:
     void onDecoderSelected(quint64 gen, const QString &codec, const QString &decoder, bool hw);
     void onVideoSize(quint64 gen, int w, int h, int parN, int parD, int fpsN, int fpsD);
     void updateHealth();
+    void rebuild(const QString &reason);   // restart keeping the fallbacks
+    void checkOutputSpeed();
     void onFirstFrame(quint64 gen);
 
     GstElement *buildTail(PipelineCtx *ctx, QString *error);
@@ -270,6 +284,8 @@ private:
     qreal m_fps = 0;
     qreal m_inFps = 0;
     qreal m_shownFps = 0;
+    qreal m_uploadFps = 0;
+    quint64 m_lastUploaded = 0;
     qreal m_nominalFps = 0;
     qreal m_frameAge = 0;
     qreal m_renderFps = -1;
@@ -284,6 +300,11 @@ private:
     bool m_suspended = false;
     bool m_hwFailed = false;     // auto mode: HW decoder failed -> use software
     bool m_needConvert = false;  // decoder output not GL-uploadable -> videoconvert
+    int m_output = OutputAuto;   // configured output path
+    int m_learned = OutputGl;    // auto mode: path found by measurement (persisted)
+    bool copyMode() const;
+    int m_slowOutTicks = 0;
+    QString m_fallbackNote;
     int m_retry = 0;
     int m_stallTicks = 0;
     int m_connectTicks = 0;

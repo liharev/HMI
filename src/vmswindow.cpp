@@ -339,6 +339,7 @@ void VmsWindow::removePlayer(Player *p)
     if (!p || !m_players.items().contains(p))
         return;
     p->disconnect(this);
+    p->setSuspended(true, true);   // stop the pipeline before the tile (GL item) goes away
     m_players.remove(p);
     p->deleteLater();          // stops its pipeline asynchronously
     renumber(ordered());

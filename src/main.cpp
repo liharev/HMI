@@ -78,7 +78,10 @@ int main(int argc, char *argv[])
     QGuiApplication::setOrganizationName(QStringLiteral("hmi"));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("CAMAI VMS"));
     QGuiApplication::setApplicationVersion(QStringLiteral(HMI_VERSION));
-    QGuiApplication::setDesktopFileName(QStringLiteral("hmi-vms"));
+    // Only announce the desktop file when it is installed: otherwise the
+    // xdg-desktop-portal registration fails with a (harmless) warning.
+    if (!QStandardPaths::locate(QStandardPaths::ApplicationsLocation, QStringLiteral("hmi-vms.desktop")).isEmpty())
+        QGuiApplication::setDesktopFileName(QStringLiteral("hmi-vms"));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("Рабочее место администратора видеонаблюдения"));

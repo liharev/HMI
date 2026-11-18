@@ -62,6 +62,8 @@ struct PipelineCtx
     std::atomic<quint64> frames{0};      // decoded (tail input)
     std::atomic<quint64> inFrames{0};    // compressed frames into the decoder
     std::atomic<quint64> shown{0};       // frames reaching the video sink
+    std::atomic<quint64> uploaded{0};    // frames after glupload (GL path)
+    bool debug = false;
     std::atomic<qint64> lastFrameUs{0};  // monotonic time of the last decoded frame
     std::atomic<bool> hasDecoderProbe{false};
 
@@ -247,6 +249,11 @@ struct PipelineCallbacks
             if (GST_EVENT_TYPE(ev) == GST_EVENT_CAPS) {
                 GstCaps *caps = nullptr;
                 gst_event_parse_caps(ev, &caps);
+                if (ctx->debug && caps) {
+                    gchar *str = gst_caps_to_string(caps);
+                    qInfo("[%s] decoder output caps: %s", qPrintable(ctx->name), str);
+                    g_free(str);
+                }
                 const GstStructure *s = caps ? gst_caps_get_structure(caps, 0) : nullptr;
                 int w = 0, h = 0, pn = 1, pd = 1, fn = 0, fd = 1;
                 if (s && gst_structure_get_int(s, "width", &w) && gst_structure_get_int(s, "height", &h)) {
@@ -574,6 +581,8 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     p->m_flipH = o.value(QLatin1String("flipH")).toBool(false);
     p->m_flipV = o.value(QLatin1String("flipV")).toBool(false);
     p->m_webUrl = o.value(QLatin1String("webUrl")).toString();
+    p->m_output = qBound(0, o.value(QLatin1String("output")).toInt(OutputAuto), 3);
+    p->m_learned = qBound(1, o.value(QLatin1String("autoOutput")).toInt(OutputGl), 3);
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -604,6 +613,8 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("flipH"), m_flipH);
     o.insert(QLatin1String("flipV"), m_flipV);
     o.insert(QLatin1String("webUrl"), m_webUrl);
+    o.insert(QLatin1String("output"), m_output);
+    o.insert(QLatin1String("autoOutput"), m_learned);
     return o;
 }
 
@@ -760,6 +771,7 @@ QVariantMap Player::config() const
         {QStringLiteral("lowLatency"), m_lowLatency},
         {QStringLiteral("snapshotInterval"), m_snapshotInterval},
         {QStringLiteral("webUrl"), m_webUrl},
+        {QStringLiteral("output"), m_output},
         {QStringLiteral("rotation"), m_rotation},
         {QStringLiteral("flipH"), m_flipH},
         {QStringLiteral("flipV"), m_flipV},
@@ -776,6 +788,16 @@ void Player::applyConfig(const QVariantMap &c)
     const int decoder = c.value(QStringLiteral("decoder"), m_decoder).toInt();
     const bool lowLatency = c.value(QStringLiteral("lowLatency"), m_lowLatency).toBool();
     m_snapshotInterval = qBound(100, c.value(QStringLiteral("snapshotInterval"), m_snapshotInterval).toInt(), 3600000);
+    // Output path: changing it rebuilds the pipeline (and maybe the surface).
+    const int output = qBound(0, c.value(QStringLiteral("output"), m_output).toInt(), 3);
+    const bool outputChanged = output != m_output;
+    if (outputChanged) {
+        m_output = output;
+        if (output == OutputAuto)
+            m_learned = OutputGl;      // choosing "Auto" again re-measures
+        m_fallbackNote.clear();
+        Q_EMIT renderPathChanged();
+    }
     // Display-only settings: no stream restart needed.
     setWebUrl(c.value(QStringLiteral("webUrl"), m_webUrl).toString());
     setRotation(c.value(QStringLiteral("rotation"), m_rotation).toInt());
@@ -797,7 +819,7 @@ void Player::applyConfig(const QVariantMap &c)
     m_lowLatency = lowLatency;
     Q_EMIT configChanged();
     Q_EMIT persistentChanged();
-    if (streamChanged)
+    if (streamChanged || outputChanged)
         restart();
 }
 
@@ -923,6 +945,13 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
     const QString sync = (m_lowLatency && !ctx->forceSync) ? QStringLiteral("false") : QStringLiteral("true");
 
     QList<GstElement *> elems{queue};
+    if (ctx->glSink && qEnvironmentVariableIsSet("HMI_TEST_SLOW_UPLOAD")) {
+        // Developer aid: emulate a slow GPU upload to test the fallbacks.
+        if (GstElement *slow = make("identity")) {
+            gsu::setArg(slow, "sleep-time", qEnvironmentVariable("HMI_TEST_SLOW_UPLOAD"));
+            elems << slow;
+        }
+    }
     if (ctx->glSink && ctx->convert) {
         // Compatibility mode for unusual decoder output (e.g. 4:4:4, 12 bit).
         if (GstElement *vc = make("videoconvert")) {
@@ -959,6 +988,10 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
         if (GstPad *sp = gst_element_get_static_pad(sink, "sink")) {
             gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->shown, nullptr);
             gst_object_unref(sp);
+        }
+        if (GstPad *cp = gst_element_get_static_pad(conv, "sink")) {
+            gst_pad_add_probe(cp, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->uploaded, nullptr);
+            gst_object_unref(cp);
         }
         elems << up << conv << rgba << sink;
     } else {
@@ -1013,7 +1046,9 @@ void Player::startPipeline()
     ctx->gen = m_gen;
     ctx->name = m_name;
     ctx->glSink = g_glRendering && m_glItem;
-    ctx->convert = m_needConvert;
+    ctx->convert = m_needConvert || copyMode()
+                   || qEnvironmentVariableIntValue("HMI_GL_COPY") > 0;
+    ctx->debug = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     ctx->pref = (m_decoder == DecoderAuto && m_hwFailed) ? gsu::DecoderPref::Software
                                                          : gsu::DecoderPref(m_decoder);
     m_codec.clear();
@@ -1443,7 +1478,9 @@ void Player::teardown(bool synchronous)
     m_watchdog.stop();
     stopNetworkSources();
     m_fps = m_inFps = m_shownFps = m_frameAge = 0;
-    m_lastIn = m_lastShown = 0;
+    m_lastIn = m_lastShown = m_lastUploaded = 0;
+    m_uploadFps = 0;
+    m_slowOutTicks = 0;
     m_statsUs = 0;
     m_qtShown = 0;
     Q_EMIT statsChanged();
@@ -1535,13 +1572,20 @@ void Player::onWatchdog()
                                         : m_qtShown.load(std::memory_order_relaxed);
     m_shownFps = ema(m_shownFps, shown - m_lastShown);
     m_lastShown = shown;
+    const quint64 uploaded = m_ctx->uploaded.load(std::memory_order_relaxed);
+    m_uploadFps = ema(m_uploadFps, uploaded - m_lastUploaded);
+    m_lastUploaded = uploaded;
     const qint64 last = m_ctx->lastFrameUs.load(std::memory_order_relaxed);
     m_frameAge = last > 0 ? qreal(g_get_monotonic_time() - last) / 1e6 : 0;
     updateHealth();
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
-        qInfo("[%s] in %.1f dec %.1f shown %.1f render %.1f nominal %.1f age %.2f | %s", qPrintable(m_name),
-              m_inFps, m_fps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge, qPrintable(m_healthText));
+        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f path %s | %s",
+              qPrintable(m_name), m_inFps, m_fps, m_uploadFps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge,
+              qPrintable(renderPath()), qPrintable(m_healthText));
+    checkOutputSpeed();
+    if (!m_ctx)
+        return;     // the pipeline was rebuilt
 
     if (m_status == Playing) {
         m_stallTicks = delta == 0 ? m_stallTicks + 1 : 0;
@@ -1550,6 +1594,66 @@ void Player::onWatchdog()
     } else if (!m_gotFrame) {
         if (++m_connectTicks >= qMax(25, m_stallLimit))
             scheduleRetry(QStringLiteral("Таймаут подключения"));
+    }
+}
+
+bool Player::useQtSink() const
+{
+    const int o = m_output == OutputAuto ? m_learned : m_output;
+    return !g_glRendering || o == OutputQt;
+}
+
+bool Player::copyMode() const
+{
+    const int o = m_output == OutputAuto ? m_learned : m_output;
+    return o == OutputGlCopy;
+}
+
+QString Player::renderPath() const
+{
+    if (useQtSink())
+        return QStringLiteral("Qt Multimedia");
+    if (copyMode() || m_needConvert)
+        return QStringLiteral("GL (копирование)");
+    return QStringLiteral("GL (zero-copy)");
+}
+
+void Player::rebuild(const QString &reason)
+{
+    m_lastReconnectMs = QDateTime::currentMSecsSinceEpoch();
+    qInfo("[%s] %s", qPrintable(m_name), qPrintable(reason));
+    m_fallbackNote = reason;
+    teardown();
+    ensureRunning();
+}
+
+// Decoded frames that never reach the sink mean the GPU upload path is the
+// bottleneck (e.g. DMA-BUF import is slow on this kernel/Mesa combination).
+// Try the copy mode first, then the Qt Multimedia output.
+void Player::checkOutputSpeed()
+{
+    if (m_output != OutputAuto || m_status != Playing || !m_ctx || !m_ctx->glSink || !m_gotFrame) {
+        m_slowOutTicks = 0;
+        return;
+    }
+    if (m_fps >= 3 && m_shownFps < 0.3 * m_fps)
+        ++m_slowOutTicks;
+    else
+        m_slowOutTicks = 0;
+    if (m_slowOutTicks < 6)
+        return;
+    m_slowOutTicks = 0;
+    // The result is remembered (persisted) so the next start uses it at once.
+    if (m_learned == OutputGl && !m_needConvert) {
+        m_learned = OutputGlCopy;
+        Q_EMIT renderPathChanged();
+        Q_EMIT persistentChanged();
+        rebuild(QStringLiteral("Медленная загрузка кадров в GPU: включён режим копирования"));
+    } else if (m_learned != OutputQt) {
+        m_learned = OutputQt;
+        Q_EMIT renderPathChanged();   // the tile replaces its video surface
+        Q_EMIT persistentChanged();
+        rebuild(QStringLiteral("Вывод через GPU не успевает: переключено на Qt Multimedia"));
     }
 }
 
@@ -1612,6 +1716,8 @@ void Player::updateHealth()
             h = HealthWarning;
             t = QStringLiteral("Аппаратный декодер не справился, работает программный");
         }
+        if (!m_fallbackNote.isEmpty())
+            t += QStringLiteral("\nВывод: ") + renderPath() + QStringLiteral(" (") + m_fallbackNote + QLatin1Char(')');
         break;
     }
     }
@@ -1697,7 +1803,8 @@ void Player::clearSurface()
 {
     if (m_surfaceConn)
         disconnect(m_surfaceConn);
-    teardown();
+    // qml6glsink must be stopped before its QML item is destroyed.
+    teardown(bool(m_glItem));
     m_surface = nullptr;
     m_glItem = nullptr;
     m_videoSink = nullptr;

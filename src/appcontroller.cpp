@@ -212,7 +212,7 @@ void AppController::openWindow(VmsWindow *w)
 void AppController::createView(VmsWindow *w)
 {
     if (!m_windowComponent) {
-        m_windowComponent = new QQmlComponent(m_engine, QUrl(QStringLiteral("qrc:/HmiUi/qml/MonitorWindow.qml")),
+        m_windowComponent = new QQmlComponent(m_engine, QUrl(QStringLiteral("qrc:/HmiUi/MonitorWindow.qml")),
                                               QQmlComponent::PreferSynchronous, this);
         if (m_windowComponent->isError())
             qCritical() << m_windowComponent->errors();

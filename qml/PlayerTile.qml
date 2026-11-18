@@ -94,8 +94,20 @@ Item {
         VideoOutput { anchors.fill: parent; fillMode: VideoOutput.PreserveAspectFit }
     }
 
-    Component.onCompleted: {
-        if (App.glSink) {
+    property var surfaceItem: null
+    function createSurface() {
+        if (surfaceItem) {
+            if (surface)
+                player.detachSink(surface)
+            // GstGLQt6VideoItem crashes if it is destroyed while still
+            // parented (its windowChanged handler runs during destruction):
+            // unparent it first, while it is fully alive.
+            surfaceItem.parent = null
+            surfaceItem.destroy()
+            surfaceItem = null
+            surface = null
+        }
+        if (App.glSink && !player.useQtSink) {
             try {
                 const item = Qt.createQmlObject(
                     'import org.freedesktop.gstreamer.Qt6GLVideoItem 1.0; GstGLQt6VideoItem { anchors.fill: parent }',
@@ -103,6 +115,7 @@ Item {
                 // The GL item accepts hover/mouse events itself (navigation
                 // events); disable that so the tile's handlers get them.
                 item.enabled = false
+                surfaceItem = item
                 surface = item
                 player.attachGlItem(item)
                 return
@@ -112,8 +125,20 @@ Item {
         }
         const vo = qtSurfaceComponent.createObject(surfaceHolder)
         vo.enabled = false
+        surfaceItem = vo
         surface = vo.videoSink
         player.attachVideoSink(vo.videoSink)
+    }
+    Component.onCompleted: createSurface()
+    // Automatic fallback (GL upload too slow) switches to Qt Multimedia.
+    Connections {
+        target: tile.player
+        function onRenderPathChanged() {
+            const wantQt = !App.glSink || tile.player.useQtSink
+            const isQt = tile.surfaceItem && tile.surface !== tile.surfaceItem
+            if (wantQt !== isQt)
+                tile.createSurface()
+        }
     }
     Component.onDestruction: {
         if (player && surface)
