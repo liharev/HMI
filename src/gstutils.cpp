@@ -54,6 +54,10 @@ QStringList decoderCandidates(Codec c, DecoderPref pref)
 
 bool isHardwareDecoder(const QString &factory)
 {
+    // Developer aid for testing the fallbacks on machines without a VPU.
+    static const bool fakeHw = qEnvironmentVariableIsSet("HMI_TEST_FAKE_HW");
+    if (fakeHw && factory.startsWith(QLatin1String("avdec")))
+        return true;
     for (Codec c : {Codec::H264, Codec::H265, Codec::Jpeg})
         if (hardwareDecoders(c).contains(factory))
             return true;

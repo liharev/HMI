@@ -583,6 +583,7 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     p->m_webUrl = o.value(QLatin1String("webUrl")).toString();
     p->m_output = qBound(0, o.value(QLatin1String("output")).toInt(OutputAuto), 3);
     p->m_learned = qBound(1, o.value(QLatin1String("autoOutput")).toInt(OutputGl), 3);
+    p->m_hwSlow = o.value(QLatin1String("autoSoftware")).toBool(false);
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -615,6 +616,7 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("webUrl"), m_webUrl);
     o.insert(QLatin1String("output"), m_output);
     o.insert(QLatin1String("autoOutput"), m_learned);
+    o.insert(QLatin1String("autoSoftware"), m_hwSlow);
     return o;
 }
 
@@ -793,8 +795,10 @@ void Player::applyConfig(const QVariantMap &c)
     const bool outputChanged = output != m_output;
     if (outputChanged) {
         m_output = output;
-        if (output == OutputAuto)
+        if (output == OutputAuto) {
             m_learned = OutputGl;      // choosing "Auto" again re-measures
+            m_hwSlow = false;
+        }
         m_fallbackNote.clear();
         Q_EMIT renderPathChanged();
     }
@@ -815,6 +819,8 @@ void Player::applyConfig(const QVariantMap &c)
     m_password = pass;
     m_transport = transport;
     m_latency = latency;
+    if (decoder != m_decoder)
+        m_hwSlow = false;          // a new decoder choice is measured again
     m_decoder = decoder;
     m_lowLatency = lowLatency;
     Q_EMIT configChanged();
@@ -945,7 +951,7 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
     const QString sync = (m_lowLatency && !ctx->forceSync) ? QStringLiteral("false") : QStringLiteral("true");
 
     QList<GstElement *> elems{queue};
-    if (ctx->glSink && qEnvironmentVariableIsSet("HMI_TEST_SLOW_UPLOAD")) {
+    if (qEnvironmentVariableIsSet("HMI_TEST_SLOW_UPLOAD")) {
         // Developer aid: emulate a slow GPU upload to test the fallbacks.
         if (GstElement *slow = make("identity")) {
             gsu::setArg(slow, "sleep-time", qEnvironmentVariable("HMI_TEST_SLOW_UPLOAD"));
@@ -1049,7 +1055,7 @@ void Player::startPipeline()
     ctx->convert = m_needConvert || copyMode()
                    || qEnvironmentVariableIntValue("HMI_GL_COPY") > 0;
     ctx->debug = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
-    ctx->pref = (m_decoder == DecoderAuto && m_hwFailed) ? gsu::DecoderPref::Software
+    ctx->pref = (m_decoder == DecoderAuto && (m_hwFailed || m_hwSlow)) ? gsu::DecoderPref::Software
                                                          : gsu::DecoderPref(m_decoder);
     m_codec.clear();
     m_decoderName.clear();
@@ -1580,9 +1586,9 @@ void Player::onWatchdog()
     updateHealth();
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
-        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f path %s | %s",
+        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f path %s decoder %s | %s",
               qPrintable(m_name), m_inFps, m_fps, m_uploadFps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge,
-              qPrintable(renderPath()), qPrintable(m_healthText));
+              qPrintable(renderPath()), qPrintable(m_decoderName), qPrintable(QString(m_healthText).replace(QLatin1Char('\n'), QLatin1String(" / "))));
     checkOutputSpeed();
     if (!m_ctx)
         return;     // the pipeline was rebuilt
@@ -1632,7 +1638,8 @@ void Player::rebuild(const QString &reason)
 // Try the copy mode first, then the Qt Multimedia output.
 void Player::checkOutputSpeed()
 {
-    if (m_output != OutputAuto || m_status != Playing || !m_ctx || !m_ctx->glSink || !m_gotFrame) {
+    const bool canSwitchDecoder = m_decoder == DecoderAuto && m_hwDecoding && !m_hwSlow;
+    if ((m_output != OutputAuto && !canSwitchDecoder) || m_status != Playing || !m_ctx || !m_gotFrame) {
         m_slowOutTicks = 0;
         return;
     }
@@ -1644,7 +1651,20 @@ void Player::checkOutputSpeed()
         return;
     m_slowOutTicks = 0;
     // The result is remembered (persisted) so the next start uses it at once.
-    if (m_learned == OutputGl && !m_needConvert) {
+    // First suspect: frames of the hardware decoder live in memory that is
+    // very slow to read/import (seen with V4L2 stateless decoders on RK3588
+    // mainline kernels). Software-decoded frames are in normal cached memory
+    // and can use the fastest output again.
+    if (canSwitchDecoder) {
+        m_hwSlow = true;
+        if (m_output == OutputAuto)
+            m_learned = OutputGl;
+        Q_EMIT renderPathChanged();
+        Q_EMIT persistentChanged();
+        rebuild(QStringLiteral("Кадры аппаратного декодера не успевают на экран: включено программное декодирование"));
+    } else if (m_output != OutputAuto) {
+        return;
+    } else if (m_learned == OutputGl && !m_needConvert) {
         m_learned = OutputGlCopy;
         Q_EMIT renderPathChanged();
         Q_EMIT persistentChanged();

@@ -302,6 +302,7 @@ private:
     bool m_needConvert = false;  // decoder output not GL-uploadable -> videoconvert
     int m_output = OutputAuto;   // configured output path
     int m_learned = OutputGl;    // auto mode: path found by measurement (persisted)
+    bool m_hwSlow = false;       // auto decoder: HW frames too slow to display -> software (persisted)
     bool copyMode() const;
     int m_slowOutTicks = 0;
     QString m_fallbackNote;
