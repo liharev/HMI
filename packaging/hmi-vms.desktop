@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HMI VMS
+Name[ru]=HMI VMS — видеонаблюдение
+Comment=Video surveillance workstation (RTSP, H.264/H.265/MJPEG)
+Comment[ru]=Рабочее место администратора видеонаблюдения
+Exec=hmi-vms
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=rtsp;camera;cctv;vms;

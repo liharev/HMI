@@ -1,0 +1,70 @@
+cmake_minimum_required(VERSION 3.16)
+project(hmi-vms VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+option(HMI_CPU_TUNING "Tune code for the RK3588 CPU cores (Cortex-A76/A55) on aarch64" ON)
+option(HMI_LTO "Enable link-time optimisation" ON)
+
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Network)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GST REQUIRED IMPORTED_TARGET
+    gstreamer-1.0>=1.20 gstreamer-video-1.0>=1.20 gstreamer-app-1.0>=1.20)
+
+qt_standard_project_setup()
+
+qt_add_executable(hmi-vms
+    src/main.cpp
+    src/gstutils.h src/gstutils.cpp
+    src/player.h src/player.cpp
+    src/vmswindow.h src/vmswindow.cpp
+    src/appcontroller.h src/appcontroller.cpp
+)
+
+qt_add_qml_module(hmi-vms
+    URI HmiUi
+    VERSION 1.0
+    RESOURCE_PREFIX /
+    QML_FILES
+        qml/MonitorWindow.qml
+        qml/PlayerTile.qml
+        qml/PlayerDialog.qml
+        qml/WindowDialog.qml
+        qml/ToolIconButton.qml
+        qml/HeaderButton.qml
+        qml/ConfirmDialog.qml
+)
+
+target_compile_definitions(hmi-vms PRIVATE
+    HMI_VERSION="${PROJECT_VERSION}"
+    QT_NO_KEYWORDS            # GStreamer/GLib headers use "signals"
+    $<$<CONFIG:Release>:QT_NO_DEBUG_OUTPUT>)
+
+target_link_libraries(hmi-vms PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2
+    Qt6::Multimedia Qt6::Network
+    PkgConfig::GST)
+
+if(HMI_CPU_TUNING AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mcpu=cortex-a76.cortex-a55" HMI_HAS_BIGLITTLE)
+    if(HMI_HAS_BIGLITTLE)
+        target_compile_options(hmi-vms PRIVATE -mcpu=cortex-a76.cortex-a55)
+    endif()
+endif()
+
+if(HMI_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT HMI_IPO OUTPUT HMI_IPO_MSG)
+    if(HMI_IPO)
+        set_property(TARGET hmi-vms PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS hmi-vms RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES packaging/hmi-vms.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
