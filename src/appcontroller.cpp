@@ -162,6 +162,7 @@ void AppController::balanceDecoders()
             }
         if (moved > 0 && movedLagging * 2 >= moved) {
             m_balanceOff = true;
+            m_hwCapacity = 0;          // measured while starved by the source: not the VPU limit
             for (Player *p : all)
                 if (p->balancedSoftware())
                     p->setBalancedSoftware(false);
@@ -190,13 +191,15 @@ void AppController::balanceDecoders()
             m_verifyMove = true;
             scheduleSave();
         }
-    } else if (settled && lagging.isEmpty() && m_hwCapacity > 0) {
+    } else if (settled && lagging.isEmpty()) {
+        // Unknown capacity: bring streams back one by one and let a new
+        // saturation (if any) measure it.
         // Headroom: bring one stream back (the lightest one).
         Player *best = nullptr;
         for (Player *p : sw)
             if (p->balancedSoftware() && p->pixelRate() > 0 && (!best || p->pixelRate() < best->pixelRate()))
                 best = p;
-        if (best && hwPx + best->pixelRate() < 0.8 * m_hwCapacity) {
+        if (best && (m_hwCapacity <= 0 || hwPx + best->pixelRate() < 0.8 * m_hwCapacity)) {
             best->setBalancedSoftware(false);
             m_lastBalanceMs = now;
             scheduleSave();
@@ -223,6 +226,13 @@ void AppController::balanceDecoders()
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
         qInfo("[balance] %s", qPrintable(text));
+}
+
+QString AppController::decoderEnvironment() const
+{
+    QFile f(QStringLiteral("/proc/sys/kernel/osrelease"));
+    const QString kernel = f.open(QIODevice::ReadOnly) ? QString::fromLatin1(f.readAll().trimmed()) : QString();
+    return kernel + QLatin1Char('|') + gsu::hardwareSummary();
 }
 
 QList<Player *> AppController::allPlayers() const
@@ -295,6 +305,16 @@ void AppController::load()
         m_hwCapacity = root.value(QLatin1String("hwCapacity")).toDouble(0);
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
+        // Automatic decisions are only valid for the environment they were
+        // made in (e.g. software decoding chosen on a weak mainline VPU must
+        // not stick after switching to the vendor kernel with MPP).
+        if (root.value(QLatin1String("decoderEnv")).toString() != decoderEnvironment()) {
+            m_hwCapacity = 0;
+            for (Player *p : allPlayers())
+                p->resetLearned();
+            qInfo("Kernel/decoders changed (%s): automatic decoder/output decisions reset",
+                  qPrintable(decoderEnvironment()));
+        }
     }
     if (m_windows.isEmpty()) {
         newWindow();
@@ -573,7 +593,8 @@ void AppController::save()
     for (VmsWindow *w : m_windows)
         arr.append(w->toJson());
     QJsonObject root{{QStringLiteral("version"), 1}, {QStringLiteral("windows"), arr},
-                     {QStringLiteral("hwCapacity"), m_hwCapacity}};
+                     {QStringLiteral("hwCapacity"), m_hwCapacity},
+                     {QStringLiteral("decoderEnv"), decoderEnvironment()}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);
     if (!f.open(QIODevice::WriteOnly)) {

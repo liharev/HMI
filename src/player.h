@@ -180,6 +180,9 @@ public:
     // true: this "Auto" decoder player was moved to software decoding.
     bool balancedSoftware() const { return m_balancedSw; }
     void setBalancedSoftware(bool sw);
+    // Forget automatic decisions (decoder/output fallbacks, balancing): used
+    // when the kernel or the set of hardware decoders changed.
+    void resetLearned();
     bool movableDecoder() const { return m_decoder == DecoderAuto && !m_hwFailed && !m_hwSlow; }
     // Decoded pixels per second the stream needs (0 if not known yet).
     qreal pixelRate() const;

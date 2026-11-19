@@ -56,6 +56,7 @@ public:
     QString decoderBalance() const { return m_balanceText; }
     Diagnostics *diag() const { return m_diag; }
     QList<Player *> allPlayers() const;
+    QString decoderEnvironment() const;   // kernel + available hardware decoders
     bool balanceOff() const { return m_balanceOff; }
     Q_INVOKABLE void openDiagnostics();
 

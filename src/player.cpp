@@ -1674,6 +1674,18 @@ bool Player::copyMode() const
     return o == OutputGlCopy;
 }
 
+void Player::resetLearned()
+{
+    m_balancedSw = false;
+    m_hwSlow = false;
+    m_hwFailed = false;
+    m_needConvert = false;
+    m_learned = OutputGl;
+    m_fallbackNote.clear();
+    Q_EMIT renderPathChanged();
+    Q_EMIT persistentChanged();
+}
+
 void Player::setBalancedSoftware(bool sw)
 {
     if (sw == m_balancedSw)

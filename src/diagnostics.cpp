@@ -350,6 +350,37 @@ QVariantMap Diagnostics::memorySection()
     if (swapT > 0)
         bars << bar(QStringLiteral("Подкачка"), qreal(swapT - swapF) / swapT, 0, gib(swapT - swapF));
 
+    // Who uses the memory (only when it is tight: scanning /proc costs a bit).
+    QVariantList details{kv(QStringLiteral("Использует CAMAI VMS"), QStringLiteral("%1 МБ").arg(rss / 1024))};
+    if (st > 0) {
+        QList<QPair<qint64, QString>> procs;
+        QHash<QString, qint64> byName;
+        const QDir proc(QStringLiteral("/proc"));
+        for (const QString &pid : proc.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+            if (!pid.at(0).isDigit())
+                continue;
+            QString name;
+            qint64 r = 0;
+            for (const QByteArray &l : readFile(proc.filePath(pid + QStringLiteral("/status"))).split('\n')) {
+                if (l.startsWith("Name:"))
+                    name = QString::fromUtf8(l.mid(5).trimmed());
+                else if (l.startsWith("VmRSS:"))
+                    r = l.mid(6).simplified().split(' ').value(0).toLongLong();
+            }
+            if (r > 0 && !name.isEmpty())
+                byName[name] += r;        // sum processes of one program (browsers, Electron)
+        }
+        for (auto it = byName.cbegin(); it != byName.cend(); ++it)
+            procs << qMakePair(it.value(), it.key());
+        std::sort(procs.begin(), procs.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        QStringList top;
+        for (int i = 0; i < qMin(5, int(procs.size())); ++i)
+            top << QStringLiteral("%1 — %2 МБ").arg(procs[i].second).arg(procs[i].first / 1024);
+        details << kv(QStringLiteral("Больше всего памяти занимают"), top.join(QStringLiteral(", ")));
+        advice << QStringLiteral("Закройте ненужные программы из списка выше (браузеры и Electron-приложения занимают "
+                                 "сотни МБ). Для постоянной работы станции видеонаблюдения лучше запускать только её.");
+    }
+
     return {
         {QStringLiteral("id"), QStringLiteral("memory")},
         {QStringLiteral("title"), QStringLiteral("Оперативная память")},
@@ -360,8 +391,7 @@ QVariantMap Diagnostics::memorySection()
         {QStringLiteral("gaugeText"), pct(used)},
         {QStringLiteral("gaugeLabel"), QStringLiteral("занято")},
         {QStringLiteral("bars"), bars},
-        {QStringLiteral("details"), QVariantList{kv(QStringLiteral("Использует CAMAI VMS"),
-                                                    QStringLiteral("%1 МБ").arg(rss / 1024))}},
+        {QStringLiteral("details"), details},
         {QStringLiteral("advice"), advice},
     };
 }
@@ -454,7 +484,7 @@ QVariantMap Diagnostics::networkSection()
 QVariantMap Diagnostics::decoderSection()
 {
     const QList<Player *> players = m_app->allPlayers();
-    int hw = 0, sw = 0, moved = 0, lagging = 0, hevcSw = 0;
+    int hw = 0, sw = 0, moved = 0, lagging = 0, hevcSw = 0, forcedSw = 0, fallbackSw = 0;
     QHash<QString, int> byDecoder;
     for (Player *p : players) {
         if (p->status() != Player::Playing || p->decoderName().isEmpty())
@@ -468,6 +498,10 @@ QVariantMap Diagnostics::decoderSection()
             ++sw;
             if (p->balancedSoftware())
                 ++moved;
+            else if (p->decoder() == Player::DecoderSoftware)
+                ++forcedSw;
+            else if (p->decoder() == Player::DecoderAuto && p->codec() != QLatin1String("RAW"))
+                ++fallbackSw;
             if (p->codec() == QLatin1String("H.265"))
                 ++hevcSw;
         }
@@ -492,8 +526,23 @@ QVariantMap Diagnostics::decoderSection()
         advice << QStringLiteral("Аппаратный декодер не успевает: программа переносит часть потоков на процессор "
                                  "(для плееров с декодером «Авто»).");
     }
+    if (hasHw && sw > 0 && hw == 0 && sw > 2) {
+        st = worse(st, 2);
+        advice << QStringLiteral("Аппаратный декодер есть, но все %1 поток(ов) декодирует процессор: это сильно нагружает "
+                                 "CPU и вывод.").arg(sw);
+    } else if (hasHw && sw > hw && sw > 2) {
+        st = worse(st, 1);
+    }
     if (moved > 0)
-        advice << QStringLiteral("%1 поток(ов) перенесено на процессор из-за загрузки аппаратного декодера.").arg(moved);
+        advice << QStringLiteral("%1 поток(ов) перенесено на процессор автоматическим распределением. Если аппаратный декодер "
+                                 "свободен, они вернутся сами (по одному каждые ~10 с).").arg(moved);
+    if (forcedSw > 0 && hasHw)
+        advice << QStringLiteral("%1 плеер(ов) настроены «Декодер: Только программный» — переключите на «Авто» в "
+                                 "настройках плеера.").arg(forcedSw);
+    if (fallbackSw > 0 && hasHw)
+        advice << QStringLiteral("%1 поток(ов) с декодером «Авто» перешли на программный после сбоя аппаратного декодера. "
+                                 "Чтобы проверить заново, в настройках плеера выберите другой декодер и снова «Авто».")
+                      .arg(fallbackSw);
     if (hevcSw > 0 && !hasMpp) {
         st = worse(st, 1);
         advice << QStringLiteral("%1 поток(ов) H.265 декодируются процессором: аппаратного декодера H.265 нет "
