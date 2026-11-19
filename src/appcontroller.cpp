@@ -1,4 +1,5 @@
 #include "appcontroller.h"
+#include "diagnostics.h"
 #include "gstutils.h"
 #include "player.h"
 #include "vmswindow.h"
@@ -46,6 +47,8 @@ AppController::AppController(QQmlEngine *engine, bool glSink, const QString &con
             it.key()->setRenderFps(it.value()->exchange(0) / dt);
     });
     m_fpsTimer.start();
+
+    m_diag = new Diagnostics(this);
 
     m_balanceTimer.setInterval(3000);
     connect(&m_balanceTimer, &QTimer::timeout, this, &AppController::balanceDecoders);
@@ -220,6 +223,38 @@ void AppController::balanceDecoders()
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
         qInfo("[balance] %s", qPrintable(text));
+}
+
+QList<Player *> AppController::allPlayers() const
+{
+    QList<Player *> all;
+    for (VmsWindow *w : m_windows)
+        all += w->players()->items();
+    return all;
+}
+
+void AppController::openDiagnostics()
+{
+    if (m_diagView) {
+        if (m_diagView->visibility() == QWindow::Minimized)
+            m_diagView->showNormal();
+        m_diagView->show();
+        m_diagView->raise();
+        m_diagView->requestActivate();
+        return;
+    }
+    QQmlComponent comp(m_engine, QUrl(QStringLiteral("qrc:/HmiUi/DiagnosticsWindow.qml")));
+    QObject *obj = comp.create();
+    auto *view = qobject_cast<QQuickWindow *>(obj);
+    if (!view) {
+        qCritical() << "Cannot create the diagnostics window:" << comp.errors();
+        delete obj;
+        return;
+    }
+    QQmlEngine::setObjectOwnership(view, QQmlEngine::CppOwnership);
+    m_diagView = view;
+    view->show();
+    view->raise();
 }
 
 bool AppController::softwareRendering() const
@@ -574,6 +609,7 @@ void AppController::shutdown()
     for (VmsWindow *w : m_windows)
         w->setSuspended(true);
     QThreadPool::globalInstance()->waitForDone(5000);
+    delete m_diagView.data();
     for (auto it = m_views.begin(); it != m_views.end(); ++it) {
         if (QQuickWindow *v = it.value()) {
             QObject::disconnect(v, nullptr, it.key(), nullptr);

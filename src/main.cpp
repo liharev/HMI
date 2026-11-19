@@ -1,6 +1,7 @@
 // HMI VMS - video surveillance operator/administrator workstation.
 // Qt 6 Quick UI + GStreamer pipelines with hardware decoding (RK3588 MPP/V4L2).
 #include "appcontroller.h"
+#include "diagnostics.h"
 #include "gstutils.h"
 #include "player.h"
 #include "vmswindow.h"
@@ -156,6 +157,7 @@ int main(int argc, char *argv[])
     qmlRegisterUncreatableType<Player>("HmiCore", 1, 0, "Player", QStringLiteral("created by VmsWindow"));
     qmlRegisterUncreatableType<VmsWindow>("HmiCore", 1, 0, "VmsWindow", QStringLiteral("created by App"));
     qmlRegisterUncreatableType<PlayerListModel>("HmiCore", 1, 0, "PlayerListModel", QStringLiteral("internal"));
+    qmlRegisterUncreatableType<Diagnostics>("HmiCore", 1, 0, "Diagnostics", QStringLiteral("internal"));
 
     AppController controller(&engine, glSink, configPath);
     qmlRegisterSingletonInstance("HmiCore", 1, 0, "App", &controller);

@@ -61,6 +61,7 @@ struct PipelineCtx
     std::atomic<int> videoStream{-1};
     std::atomic<quint64> frames{0};      // decoded (tail input)
     std::atomic<quint64> inFrames{0};    // compressed frames into the decoder
+    std::atomic<quint64> inBytes{0};     // compressed bytes into the decoder
     std::atomic<quint64> shown{0};       // frames reaching the video sink
     std::atomic<quint64> uploaded{0};    // frames after glupload (GL path)
     bool debug = false;
@@ -288,6 +289,13 @@ struct PipelineCallbacks
         return GST_PAD_PROBE_OK;
     }
 
+    static GstPadProbeReturn bytesProbe(GstPad *, GstPadProbeInfo *info, gpointer data)
+    {
+        if (GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info))
+            static_cast<std::atomic<quint64> *>(data)->fetch_add(gst_buffer_get_size(b), std::memory_order_relaxed);
+        return GST_PAD_PROBE_OK;
+    }
+
     static GstPadProbeReturn countProbe(GstPad *, GstPadProbeInfo *, gpointer data)
     {
         static_cast<std::atomic<quint64> *>(data)->fetch_add(1, std::memory_order_relaxed);
@@ -392,6 +400,7 @@ struct PipelineCallbacks
         if (GstPad *dsink = gst_element_get_static_pad(decoder, "sink")) {
             // Frames received from the network (statistics / traffic light).
             gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->inFrames, nullptr);
+            gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::bytesProbe, &ctx->inBytes, nullptr);
             if ((isHw || qEnvironmentVariableIsSet("HMI_TEST_LIMIT_ALL")) && qEnvironmentVariableIsSet("HMI_TEST_HW_FPS"))
                 gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::hwLimitProbe, nullptr, nullptr);
             gst_object_unref(dsink);
@@ -1529,7 +1538,8 @@ void Player::teardown(bool synchronous)
     m_watchdog.stop();
     stopNetworkSources();
     m_fps = m_inFps = m_shownFps = m_frameAge = 0;
-    m_lastIn = m_lastShown = m_lastUploaded = 0;
+    m_lastIn = m_lastShown = m_lastUploaded = m_lastBytes = 0;
+    m_bitrate = 0;
     m_uploadFps = 0;
     m_slowOutTicks = 0;
     m_statsUs = 0;
@@ -1623,6 +1633,10 @@ void Player::onWatchdog()
                                         : m_qtShown.load(std::memory_order_relaxed);
     m_shownFps = ema(m_shownFps, shown - m_lastShown);
     m_lastShown = shown;
+    const quint64 bytes = m_ctx->inBytes.load(std::memory_order_relaxed);
+    m_bitrate = ema(m_bitrate * 1e6 / 8.0, bytes - m_lastBytes) * 8.0 / 1e6;   // EMA in bytes/s
+    m_bitrate = qMax<qreal>(0, m_bitrate);
+    m_lastBytes = bytes;
     const quint64 uploaded = m_ctx->uploaded.load(std::memory_order_relaxed);
     m_uploadFps = ema(m_uploadFps, uploaded - m_lastUploaded);
     m_lastUploaded = uploaded;

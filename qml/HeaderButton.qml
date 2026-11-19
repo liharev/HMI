@@ -6,7 +6,10 @@ AbstractButton {
     id: control
     property color fg: "white"
     property string tip: ""
-    implicitWidth: label.implicitWidth + 18
+    padding: 9
+    topPadding: 0
+    bottomPadding: 0
+    implicitWidth: label.implicitWidth + leftPadding + rightPadding
     implicitHeight: Math.max(30, label.implicitHeight + 10)
     font.bold: checked
     hoverEnabled: true

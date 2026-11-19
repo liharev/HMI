@@ -8,6 +8,8 @@
 #include <QTimer>
 #include <QVariantList>
 
+#include "diagnostics.h"
+
 #include <atomic>
 #include <memory>
 
@@ -16,6 +18,8 @@ class QQmlComponent;
 class QQuickWindow;
 class QLocalServer;
 class VmsWindow;
+class Player;
+
 
 class AppController : public QObject
 {
@@ -32,6 +36,7 @@ class AppController : public QObject
     Q_PROPERTY(bool softwareRendering READ softwareRendering NOTIFY glInfoChanged)
     Q_PROPERTY(QVariantList builtinWallpapers READ builtinWallpapers CONSTANT)
     Q_PROPERTY(QString decoderBalance READ decoderBalance NOTIFY decoderBalanceChanged)
+    Q_PROPERTY(Diagnostics *diag READ diag CONSTANT)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -49,6 +54,10 @@ public:
     bool softwareRendering() const;
     QVariantList builtinWallpapers() const;
     QString decoderBalance() const { return m_balanceText; }
+    Diagnostics *diag() const { return m_diag; }
+    QList<Player *> allPlayers() const;
+    bool balanceOff() const { return m_balanceOff; }
+    Q_INVOKABLE void openDiagnostics();
 
     void load();
     bool listen(const QString &serverName);
@@ -101,6 +110,8 @@ private:
     bool m_verifyMove = false;   // check whether the last move to software helped
     bool m_balanceOff = false;   // moving did not help: the bottleneck is the source/network
     QString m_balanceText;
+    Diagnostics *m_diag = nullptr;
+    QPointer<QQuickWindow> m_diagView;
     QLocalServer *m_server = nullptr;
     bool m_quitting = false;
 };

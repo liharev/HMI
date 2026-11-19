@@ -178,6 +178,31 @@ ApplicationWindow {
                 text: "Окна ▾"
                 onClicked: windowsMenu.popup(this, 0, height)
             }
+            // Diagnostics with a traffic light (worst subsystem).
+            HeaderButton {
+                id: diagButton
+                fg: root.accentText
+                text: "Диагностика"
+                leftPadding: diagDot.width + 14
+                tip: App.diag.summary
+                onClicked: App.openDiagnostics()
+                Rectangle {
+                    id: diagDot
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.round(root.em * 0.65); height: width; radius: width / 2
+                    color: App.diag.status === 2 ? "#ef4444" : App.diag.status === 1 ? "#eab308" : "#22c55e"
+                    border.color: Qt.rgba(0, 0, 0, 0.45)
+                    SequentialAnimation on opacity {
+                        running: App.diag.status === 2
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 0.35; duration: 700 }
+                        NumberAnimation { to: 1.0; duration: 700 }
+                        onRunningChanged: if (!running) diagDot.opacity = 1
+                    }
+                }
+            }
             HeaderButton {
                 fg: root.accentText
                 text: "⋮"
@@ -336,6 +361,7 @@ ApplicationWindow {
         MenuItem { text: "Запустить все плееры"; onTriggered: root.win.startAll() }
         MenuItem { text: "Остановить все плееры"; onTriggered: root.win.stopAll() }
         MenuSeparator {}
+        MenuItem { text: "Диагностика…"; onTriggered: App.openDiagnostics() }
         MenuItem { text: "О программе…"; onTriggered: aboutDialog.open() }
         MenuItem { text: "Выход\tCtrl+Q"; onTriggered: App.quit() }
     }

@@ -25,6 +25,7 @@ qt_add_executable(hmi-vms
     src/player.h src/player.cpp
     src/vmswindow.h src/vmswindow.cpp
     src/appcontroller.h src/appcontroller.cpp
+    src/diagnostics.h src/diagnostics.cpp
 )
 
 # QML sources live in qml/ but are placed at the module root (no extra
@@ -37,6 +38,7 @@ set(HMI_QML_FILES
     qml/ToolIconButton.qml
     qml/HeaderButton.qml
     qml/ConfirmDialog.qml
+    qml/DiagnosticsWindow.qml
 )
 foreach(f IN LISTS HMI_QML_FILES)
     get_filename_component(n "${f}" NAME)

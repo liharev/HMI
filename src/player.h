@@ -71,6 +71,7 @@ class Player : public QObject
     Q_PROPERTY(qreal shownFps READ shownFps NOTIFY statsChanged)    // delivered to the screen
     Q_PROPERTY(qreal nominalFps READ nominalFps NOTIFY statsChanged) // from the stream, 0 = unknown
     Q_PROPERTY(qreal frameAge READ frameAge NOTIFY statsChanged)    // s since the last frame
+    Q_PROPERTY(qreal bitrate READ bitrate NOTIFY statsChanged)      // Mbit/s of compressed video received
     // Traffic light: -1 none (stopped), 0 green, 1 yellow, 2 red.
     Q_PROPERTY(int health READ health NOTIFY statsChanged)
     Q_PROPERTY(QString healthText READ healthText NOTIFY statsChanged)
@@ -168,6 +169,7 @@ public:
     qreal shownFps() const { return m_shownFps; }
     qreal nominalFps() const { return m_nominalFps; }
     qreal frameAge() const { return m_frameAge; }
+    qreal bitrate() const { return m_bitrate; }
     int health() const { return m_health; }
     QString healthText() const { return m_healthText; }
     // Frames/s the window actually renders (measured by the window).
@@ -295,6 +297,8 @@ private:
     qreal m_inFps = 0;
     qreal m_shownFps = 0;
     qreal m_uploadFps = 0;
+    qreal m_bitrate = 0;
+    quint64 m_lastBytes = 0;
     quint64 m_lastUploaded = 0;
     qreal m_nominalFps = 0;
     qreal m_frameAge = 0;
