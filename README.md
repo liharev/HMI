@@ -135,7 +135,14 @@ gst-inspect-1.0 | grep -Ei "mpp|v4l2sl"
   ./scripts/install-deps.sh --rockchip
   ```
 
-  На Armbian на базе Debian соберите
+  Если готовых пакетов для вашего дистрибутива нет (например, Ubuntu 26.04 / Debian),
+  соберите MPP, librga и плагин GStreamer из исходников одной командой:
+
+  ```bash
+  ./scripts/build-rockchip-mpp.sh
+  ```
+
+  Вручную: соберите
   [gstreamer-rockchip](https://github.com/JeffyCN/rockchip_mirrors/tree/gstreamer-rockchip)
   и [mpp](https://github.com/rockchip-linux/mpp) из исходников. Признак успеха — `mppvideodec` в списке.
 - **Mainline/edge-ядро (6.12+)** — декодеры V4L2 stateless из `gstreamer1.0-plugins-bad`
