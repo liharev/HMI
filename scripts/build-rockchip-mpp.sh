@@ -41,19 +41,23 @@ fetch() {   # branch dir
 
 say "1/3 Rockchip MPP"
 fetch mpp mpp
-cmake -S "$SRC/mpp" -B "$SRC/mpp/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+# CMAKE_POLICY_VERSION_MINIMUM: MPP declares cmake_minimum_required < 3.5,
+# which CMake 4.x rejects without it (harmless on CMake 3.x).
+rm -rf "$SRC/mpp/_build"
+cmake -S "$SRC/mpp" -B "$SRC/mpp/_build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Wno-dev \
       -DRKPLATFORM=ON -DHAVE_DRM=ON -DBUILD_TEST=OFF
-cmake --build "$SRC/mpp/build" -j"$JOBS"
-$SUDO cmake --install "$SRC/mpp/build"
+cmake --build "$SRC/mpp/_build" -j"$JOBS"
+$SUDO cmake --install "$SRC/mpp/_build"
 $SUDO ldconfig
 
 say "2/3 librga (multi-core RGA for RK3588)"
 RGA=enabled
 if fetch linux-rga-multi rga; then
-  rm -rf "$SRC/rga/build"
-  if meson setup "$SRC/rga/build" "$SRC/rga" --prefix=/usr --buildtype=release \
+  rm -rf "$SRC/rga/_build"
+  if meson setup "$SRC/rga/_build" "$SRC/rga" --prefix=/usr --buildtype=release \
         -Dlibdrm=true -Dlibrga_demo=false \
-     && ninja -C "$SRC/rga/build" && $SUDO ninja -C "$SRC/rga/build" install; then
+     && ninja -C "$SRC/rga/_build" && $SUDO ninja -C "$SRC/rga/_build" install; then
     $SUDO ldconfig
   else
     RGA=disabled
@@ -69,10 +73,10 @@ MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo aarch64-
 OPTS=(--prefix=/usr --libdir="lib/$MULTIARCH" --buildtype=release
       -Drockchipmpp=enabled -Drga="$RGA" -Drkximage=disabled -Dkmssrc=disabled
       -Dgpu=disabled -Dvpxalphadec=disabled)
-rm -rf "$SRC/gst-rockchip/build"
-meson setup "$SRC/gst-rockchip/build" "$SRC/gst-rockchip" "${OPTS[@]}"
-ninja -C "$SRC/gst-rockchip/build"
-$SUDO ninja -C "$SRC/gst-rockchip/build" install
+rm -rf "$SRC/gst-rockchip/_build"
+meson setup "$SRC/gst-rockchip/_build" "$SRC/gst-rockchip" "${OPTS[@]}"
+ninja -C "$SRC/gst-rockchip/_build"
+$SUDO ninja -C "$SRC/gst-rockchip/_build" install
 
 say "Права на устройства видеоблока (группа video)"
 $SUDO tee /etc/udev/rules.d/99-rockchip-multimedia.rules >/dev/null <<'EOF'
