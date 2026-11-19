@@ -412,8 +412,10 @@ QVariantMap Diagnostics::networkSection()
         Net n;
         n.rx = quint64(readInt(st + QStringLiteral("rx_bytes"), 0));
         n.tx = quint64(readInt(st + QStringLiteral("tx_bytes"), 0));
-        n.errs = quint64(readInt(st + QStringLiteral("rx_errors"), 0) + readInt(st + QStringLiteral("rx_dropped"), 0)
-                         + readInt(st + QStringLiteral("rx_crc_errors"), 0));
+        // rx_dropped is not counted: it also grows for harmless packets of
+        // protocols nobody listens to (IPv6 multicast, LLDP, ...).
+        n.errs = quint64(readInt(st + QStringLiteral("rx_errors"), 0) + readInt(st + QStringLiteral("rx_crc_errors"), 0)
+                         + readInt(st + QStringLiteral("rx_frame_errors"), 0));
         cur.insert(ifc, n);
         const bool up = readFile(dir.filePath(ifc + QStringLiteral("/operstate"))) == "up";
         if (!up)
