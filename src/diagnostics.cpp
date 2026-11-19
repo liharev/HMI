@@ -118,7 +118,7 @@ QVariantMap Diagnostics::streamsSection()
     int good = 0, warnN = 0, badN = 0, off = 0;
     qreal shown = 0, nominal = 0, bitrate = 0;
     QVariantList problems;
-    bool display = false, decoder = false, source = false, noVideo = false;
+    bool display = false, decoder = false, source = false, noVideo = false;   // by health text
     for (Player *p : players) {
         switch (p->health()) {
         case Player::HealthGood: ++good; break;
@@ -439,6 +439,16 @@ QVariantMap Diagnostics::networkSection()
     }
     m_netPrev = cur;
 
+    // Streams that receive fewer frames than the camera produces.
+    int playing = 0, starved = 0;
+    for (Player *p : m_app->allPlayers()) {
+        if (p->status() != Player::Playing || p->nominalFps() <= 0)
+            continue;
+        ++playing;
+        if (p->inFps() < 0.8 * p->nominalFps())
+            ++starved;
+    }
+
     int st = mainIf.isEmpty() ? 2 : rate(mainUtil, 0.7, 0.9);
     QStringList advice;
     if (mainIf.isEmpty())
@@ -456,6 +466,14 @@ QVariantMap Diagnostics::networkSection()
                       .arg(mbps(m_streamsMbps)).arg(mainSpeed);
     } else if (st >= 1 && mainUtil >= 0.7) {
         advice << QStringLiteral("Канал загружен более чем на 70%: при пиках трафика возможны потери кадров.");
+    }
+    if (starved >= 2 && starved * 10 >= playing * 3 && mainUtil < 0.7) {
+        st = worse(st, starved * 10 >= playing * 6 ? 2 : 1);
+        advice << QStringLiteral("%1 из %2 потоков получают меньше кадров, чем снимает камера, хотя канал платы свободен "
+                                 "(загружен на %3): ограничение на стороне сервера, коммутатора или камер. Проверьте "
+                                 "сетевое подключение и загрузку сервера (Flussonic), лимиты на число зрителей/скорость; "
+                                 "сравните с другого компьютера несколькими параллельными загрузками.")
+                      .arg(starved).arg(playing).arg(pct(mainUtil));
     }
     if (errors) {
         st = worse(st, 1);
@@ -478,7 +496,9 @@ QVariantMap Diagnostics::networkSection()
              kv(QStringLiteral("Основной интерфейс"), mainIf.isEmpty() ? QStringLiteral("—") : mainIf),
              kv(QStringLiteral("Скорость подключения"),
                 mainSpeed > 0 ? QString::number(mainSpeed) + QStringLiteral(" Мбит/с") : QStringLiteral("—")),
-             kv(QStringLiteral("Нужно видеопотокам"), mbps(m_streamsMbps))}},
+             kv(QStringLiteral("Нужно видеопотокам"), mbps(m_streamsMbps)),
+             kv(QStringLiteral("Потоков с нехваткой кадров от источника"),
+                QStringLiteral("%1 из %2").arg(starved).arg(playing))}},
         {QStringLiteral("advice"), advice},
     };
 }

@@ -1805,16 +1805,20 @@ void Player::updateHealth()
         if (m_frameAge >= redAge) {
             h = HealthBad;
             t = QStringLiteral("Нет новых кадров %1 с").arg(f1(m_frameAge));
-        } else if (ref >= 2 && shown < 0.3 * ref) {
-            h = HealthBad;
-            t = m_fps >= 0.8 * m_inFps
-                    ? QStringLiteral("Отображение не успевает: %1 из %2 к/с (перегружен GPU/вывод)").arg(f1(shown), f1(ref))
-                    : QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(m_inFps));
         } else if (ref >= 2 && shown < 0.8 * ref) {
-            h = HealthWarning;
-            t = m_fps < 0.8 * m_inFps
-                    ? QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(m_inFps))
-                    : QStringLiteral("Отображение пропускает кадры: %1 из %2 к/с").arg(f1(shown), f1(ref));
+            // Which stage loses the frames: source/network -> decoder -> display.
+            const qreal lossSource = m_nominalFps > 0 ? qMax<qreal>(0, 1 - m_inFps / m_nominalFps) : 0;
+            const qreal lossDecoder = m_inFps > 0.5 ? qMax<qreal>(0, 1 - m_fps / m_inFps) : 0;
+            const qreal lossDisplay = m_fps > 0.5 ? qMax<qreal>(0, 1 - shown / m_fps) : 0;
+            h = shown < 0.3 * ref ? HealthBad : HealthWarning;
+            if (lossSource >= lossDecoder && lossSource >= lossDisplay)
+                t = QStringLiteral("Источник/сеть присылают мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(ref));
+            else if (lossDecoder >= lossDisplay)
+                t = QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(m_inFps));
+            else
+                t = (h == HealthBad ? QStringLiteral("Отображение не успевает: %1 из %2 к/с (перегружен GPU/вывод)")
+                                    : QStringLiteral("Отображение пропускает кадры: %1 из %2 к/с"))
+                        .arg(f1(shown), f1(m_fps));
         } else if (m_nominalFps > 0 && m_inFps < 0.6 * m_nominalFps) {
             h = HealthWarning;
             t = QStringLiteral("Источник присылает мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(m_nominalFps));
