@@ -24,7 +24,9 @@ esac
 [ -e /dev/mpp_service ] || echo "ВНИМАНИЕ: нет /dev/mpp_service — MPP-декодер в этом ядре недоступен." >&2
 
 say "Зависимости сборки"
-$SUDO apt-get update
+# A broken third-party repository must not stop the build (e.g. the
+# rockchip-multimedia PPA has no release for Ubuntu 26.04).
+$SUDO apt-get update || echo "ВНИМАНИЕ: apt-get update завершился с ошибкой (см. выше), продолжаю." >&2
 $SUDO apt-get install -y git cmake meson ninja-build pkg-config build-essential libdrm-dev \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 

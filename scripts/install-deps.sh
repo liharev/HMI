@@ -19,7 +19,7 @@ PKGS=(
   gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-gl
 )
 
-$SUDO apt-get update
+$SUDO apt-get update || echo "WARNING: apt-get update failed (see above), continuing." >&2
 $SUDO apt-get install -y "${PKGS[@]}"
 
 # Zero-copy GL output (qml6glsink). Not packaged on every release (e.g. Debian 12):
@@ -31,14 +31,14 @@ fi
 if [ "${1:-}" = "--rockchip" ]; then
   # Rockchip MPP (VPU) + RGA plugins for the vendor (BSP) kernel on Ubuntu 22.04/24.04 based Armbian.
   . /etc/os-release
-  if [ "${ID:-}" = "ubuntu" ]; then
+  if [ "${ID:-}" = "ubuntu" ] && { [ "${VERSION_CODENAME:-}" = "jammy" ] || [ "${VERSION_CODENAME:-}" = "noble" ]; }; then
     $SUDO apt-get install -y software-properties-common
     $SUDO add-apt-repository -y ppa:liujianfeng1994/rockchip-multimedia
     $SUDO apt-get update
     $SUDO apt-get install -y rockchip-multimedia-config gstreamer1.0-rockchip1 || \
       $SUDO apt-get install -y gstreamer1.0-rockchip1
   else
-    echo "Debian based image: build gstreamer-rockchip from source (see README, section 'Аппаратное декодирование')." >&2
+    echo "Для этого дистрибутива нет готовых пакетов MPP: соберите их скриптом ./scripts/build-rockchip-mpp.sh" >&2
   fi
 fi
 
