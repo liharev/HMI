@@ -98,6 +98,8 @@ private:
     quint64 m_cpuIdle = 0;
     quint64 m_cpuTotal = 0;
     qreal m_hwCapacity = 0;      // decoded pixels/s the VPU managed when saturated (persisted)
+    bool m_verifyMove = false;   // check whether the last move to software helped
+    bool m_balanceOff = false;   // moving did not help: the bottleneck is the source/network
     QString m_balanceText;
     QLocalServer *m_server = nullptr;
     bool m_quitting = false;

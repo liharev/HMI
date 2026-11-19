@@ -392,7 +392,7 @@ struct PipelineCallbacks
         if (GstPad *dsink = gst_element_get_static_pad(decoder, "sink")) {
             // Frames received from the network (statistics / traffic light).
             gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->inFrames, nullptr);
-            if (isHw && qEnvironmentVariableIsSet("HMI_TEST_HW_FPS"))
+            if ((isHw || qEnvironmentVariableIsSet("HMI_TEST_LIMIT_ALL")) && qEnvironmentVariableIsSet("HMI_TEST_HW_FPS"))
                 gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::hwLimitProbe, nullptr, nullptr);
             gst_object_unref(dsink);
             ctx->hasDecoderProbe = true;

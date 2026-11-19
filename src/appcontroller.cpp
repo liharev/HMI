@@ -145,7 +145,27 @@ void AppController::balanceDecoders()
     const bool settled = now - m_lastBalanceMs > 9000;
     const bool saturated = lagging.size() >= 2 && lagging.size() * 2 >= hw.size();
 
-    if (settled && saturated) {
+    // Did the last move help? If the streams moved to the CPU lag just as
+    // much, the decoder is not the bottleneck (network / server / camera):
+    // move them back and stop moving for this session.
+    if (settled && m_verifyMove) {
+        m_verifyMove = false;
+        int moved = 0, movedLagging = 0;
+        for (Player *p : sw)
+            if (p->balancedSoftware()) {
+                ++moved;
+                if (p->decoderLagging())
+                    ++movedLagging;
+            }
+        if (moved > 0 && movedLagging * 2 >= moved) {
+            m_balanceOff = true;
+            for (Player *p : all)
+                if (p->balancedSoftware())
+                    p->setBalancedSoftware(false);
+            m_lastBalanceMs = now;
+            qInfo("[balance] moving streams to the CPU did not help: the source/network limits the frame rate");
+        }
+    } else if (settled && saturated && !m_balanceOff) {
         // What the decoder really delivers is its capacity.
         m_hwCapacity = hwActualPx;
         if (cpu < 0.75) {
@@ -164,6 +184,7 @@ void AppController::balanceDecoders()
                 p->setBalancedSoftware(true);
             }
             m_lastBalanceMs = now;
+            m_verifyMove = true;
             scheduleSave();
         }
     } else if (settled && lagging.isEmpty() && m_hwCapacity > 0) {
@@ -183,13 +204,15 @@ void AppController::balanceDecoders()
     for (Player *p : sw)
         if (p->balancedSoftware())
             ++balanced;
-    const QString text = QStringLiteral("аппаратно: %1 (%2 Мпикс/с%3), программно: %4 (из них перенесено с аппаратного: %5); загрузка CPU %6%")
+    QString text = QStringLiteral("аппаратно: %1 (%2 Мпикс/с%3), программно: %4 (из них перенесено с аппаратного: %5); загрузка CPU %6%")
                              .arg(hw.size())
                              .arg(hwPx / 1e6, 0, 'f', 0)
                              .arg(m_hwCapacity > 0 ? QStringLiteral(", предел ≈ %1").arg(m_hwCapacity / 1e6, 0, 'f', 0) : QString())
                              .arg(sw.size())
                              .arg(balanced)
                              .arg(qRound(cpu * 100));
+    if (m_balanceOff)
+        text += QStringLiteral(". Перенос на CPU отключён: кадров не хватает из-за источника/сети, а не декодера");
     if (text != m_balanceText) {
         m_balanceText = text;
         Q_EMIT decoderBalanceChanged();
