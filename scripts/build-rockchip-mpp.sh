@@ -10,7 +10,8 @@
 set -euo pipefail
 
 SRC="${SRC:-$HOME/rockchip-src}"
-MIRROR="https://github.com/JeffyCN/mirrors.git"   # Rockchip developer's mirror
+MIRROR="https://github.com/JeffyCN/mirrors.git"   # Rockchip developer's mirror (RGA, GStreamer plugin)
+MPP_REPO="https://github.com/rockchip-linux/mpp.git" # official MPP: the plugin needs its current API
 JOBS="$(nproc)"
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
@@ -31,24 +32,25 @@ $SUDO apt-get install -y git cmake meson ninja-build pkg-config build-essential 
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
 mkdir -p "$SRC"
-fetch() {   # branch dir
+fetch() {   # branch dir [repo]
+  local repo="${3:-$MIRROR}"
   if [ -d "$SRC/$2/.git" ]; then
-    git -C "$SRC/$2" fetch --depth 1 origin "$1" && git -C "$SRC/$2" reset --hard FETCH_HEAD
+    git -C "$SRC/$2" fetch --depth 1 "$repo" "$1" && git -C "$SRC/$2" reset --hard FETCH_HEAD
   else
-    git clone --depth 1 -b "$1" "$MIRROR" "$SRC/$2"
+    git clone --depth 1 -b "$1" "$repo" "$SRC/$2"
   fi
 }
 
 say "1/3 Rockchip MPP"
-fetch mpp mpp
+fetch develop mpp-official "$MPP_REPO"
 # CMAKE_POLICY_VERSION_MINIMUM: MPP declares cmake_minimum_required < 3.5,
 # which CMake 4.x rejects without it (harmless on CMake 3.x).
-rm -rf "$SRC/mpp/_build"
-cmake -S "$SRC/mpp" -B "$SRC/mpp/_build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+rm -rf "$SRC/mpp-official/_build"
+cmake -S "$SRC/mpp-official" -B "$SRC/mpp-official/_build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Wno-dev \
       -DRKPLATFORM=ON -DHAVE_DRM=ON -DBUILD_TEST=OFF
-cmake --build "$SRC/mpp/_build" -j"$JOBS"
-$SUDO cmake --install "$SRC/mpp/_build"
+cmake --build "$SRC/mpp-official/_build" -j"$JOBS"
+$SUDO cmake --install "$SRC/mpp-official/_build"
 $SUDO ldconfig
 
 say "2/3 librga (multi-core RGA for RK3588)"
