@@ -17,6 +17,7 @@
 #include <QQuickWindow>
 #include <QSaveFile>
 #include <QScreen>
+#include <QDateTime>
 #include <QThreadPool>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
@@ -45,6 +46,10 @@ AppController::AppController(QQmlEngine *engine, bool glSink, const QString &con
             it.key()->setRenderFps(it.value()->exchange(0) / dt);
     });
     m_fpsTimer.start();
+
+    m_balanceTimer.setInterval(3000);
+    connect(&m_balanceTimer, &QTimer::timeout, this, &AppController::balanceDecoders);
+    m_balanceTimer.start();
 
     auto *app = qobject_cast<QGuiApplication *>(QCoreApplication::instance());
     connect(app, &QGuiApplication::screenAdded, this, &AppController::screensChanged);
@@ -90,6 +95,110 @@ QString AppController::hardwareDecoders() const
     return gsu::hardwareSummary();
 }
 
+qreal AppController::readCpuLoad()
+{
+    QFile f(QStringLiteral("/proc/stat"));
+    if (!f.open(QIODevice::ReadOnly))
+        return 0;
+    const QList<QByteArray> v = f.readLine().simplified().split(' ');   // cpu user nice system idle iowait ...
+    if (v.size() < 6)
+        return 0;
+    quint64 total = 0;
+    for (int i = 1; i < v.size(); ++i)
+        total += v[i].toULongLong();
+    const quint64 idle = v[4].toULongLong() + v[5].toULongLong();
+    const quint64 dt = total - m_cpuTotal;
+    const quint64 di = idle - m_cpuIdle;
+    const bool first = m_cpuTotal == 0;
+    m_cpuTotal = total;
+    m_cpuIdle = idle;
+    return (first || dt == 0) ? 0 : 1.0 - qreal(di) / qreal(dt);
+}
+
+// The hardware decoder of the mainline kernel serves all streams together and
+// has a limited throughput (e.g. ~60 frames/s of 1080p measured on RK3588 with
+// v4l2slh264dec): when it saturates, every stream slows down. Players with the
+// decoder set to "Auto" are then moved to software decoding (CPU) until the
+// hardware streams keep up again, and moved back when there is headroom.
+void AppController::balanceDecoders()
+{
+    const qreal cpu = readCpuLoad();
+    QList<Player *> all;
+    for (VmsWindow *w : m_windows)
+        all += w->players()->items();
+    QList<Player *> hw, sw, lagging;
+    qreal hwPx = 0, hwActualPx = 0;
+    for (Player *p : all) {
+        if (p->status() != Player::Playing)
+            continue;
+        if (p->hardwareDecoding()) {
+            hw << p;
+            hwPx += p->pixelRate();
+            hwActualPx += p->fps() * p->videoWidth() * p->videoHeight();
+            if (p->decoderLagging())
+                lagging << p;
+        } else {
+            sw << p;
+        }
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const bool settled = now - m_lastBalanceMs > 9000;
+    const bool saturated = lagging.size() >= 2 && lagging.size() * 2 >= hw.size();
+
+    if (settled && saturated) {
+        // What the decoder really delivers is its capacity.
+        m_hwCapacity = hwActualPx;
+        if (cpu < 0.75) {
+            QList<Player *> movable;
+            for (Player *p : hw)
+                if (p->movableDecoder() && p->pixelRate() > 0)
+                    movable << p;
+            std::sort(movable.begin(), movable.end(),
+                      [](Player *a, Player *b) { return a->pixelRate() > b->pixelRate(); });
+            // Move the heaviest streams until the rest fits into ~90% of the capacity.
+            qreal remaining = hwPx;
+            for (Player *p : movable) {
+                if (remaining <= 0.9 * m_hwCapacity)
+                    break;
+                remaining -= p->pixelRate();
+                p->setBalancedSoftware(true);
+            }
+            m_lastBalanceMs = now;
+            scheduleSave();
+        }
+    } else if (settled && lagging.isEmpty() && m_hwCapacity > 0) {
+        // Headroom: bring one stream back (the lightest one).
+        Player *best = nullptr;
+        for (Player *p : sw)
+            if (p->balancedSoftware() && p->pixelRate() > 0 && (!best || p->pixelRate() < best->pixelRate()))
+                best = p;
+        if (best && hwPx + best->pixelRate() < 0.8 * m_hwCapacity) {
+            best->setBalancedSoftware(false);
+            m_lastBalanceMs = now;
+            scheduleSave();
+        }
+    }
+
+    int balanced = 0;
+    for (Player *p : sw)
+        if (p->balancedSoftware())
+            ++balanced;
+    const QString text = QStringLiteral("аппаратно: %1 (%2 Мпикс/с%3), программно: %4 (из них перенесено с аппаратного: %5); загрузка CPU %6%")
+                             .arg(hw.size())
+                             .arg(hwPx / 1e6, 0, 'f', 0)
+                             .arg(m_hwCapacity > 0 ? QStringLiteral(", предел ≈ %1").arg(m_hwCapacity / 1e6, 0, 'f', 0) : QString())
+                             .arg(sw.size())
+                             .arg(balanced)
+                             .arg(qRound(cpu * 100));
+    if (text != m_balanceText) {
+        m_balanceText = text;
+        Q_EMIT decoderBalanceChanged();
+    }
+    static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
+    if (debugStats)
+        qInfo("[balance] %s", qPrintable(text));
+}
+
 bool AppController::softwareRendering() const
 {
     const QString r = m_glRenderer.toLower();
@@ -125,6 +234,7 @@ void AppController::load()
     QFile f(m_configPath);
     if (f.open(QIODevice::ReadOnly)) {
         const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+        m_hwCapacity = root.value(QLatin1String("hwCapacity")).toDouble(0);
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
     }
@@ -404,7 +514,8 @@ void AppController::save()
     QJsonArray arr;
     for (VmsWindow *w : m_windows)
         arr.append(w->toJson());
-    QJsonObject root{{QStringLiteral("version"), 1}, {QStringLiteral("windows"), arr}};
+    QJsonObject root{{QStringLiteral("version"), 1}, {QStringLiteral("windows"), arr},
+                     {QStringLiteral("hwCapacity"), m_hwCapacity}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);
     if (!f.open(QIODevice::WriteOnly)) {

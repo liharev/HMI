@@ -173,6 +173,16 @@ public:
     // Frames/s the window actually renders (measured by the window).
     void setRenderFps(qreal fps) { m_renderFps = fps; }
     bool useQtSink() const;
+
+    // Load balancing between the hardware decoder and the CPU (AppController).
+    // true: this "Auto" decoder player was moved to software decoding.
+    bool balancedSoftware() const { return m_balancedSw; }
+    void setBalancedSoftware(bool sw);
+    bool movableDecoder() const { return m_decoder == DecoderAuto && !m_hwFailed && !m_hwSlow; }
+    // Decoded pixels per second the stream needs (0 if not known yet).
+    qreal pixelRate() const;
+    // The decoder keeps up with the stream (nominal rate known).
+    bool decoderLagging() const;
     int output() const { return m_output; }
     enum Output { OutputAuto, OutputGl, OutputGlCopy, OutputQt };
     Q_ENUM(Output)
@@ -303,6 +313,7 @@ private:
     int m_output = OutputAuto;   // configured output path
     int m_learned = OutputGl;    // auto mode: path found by measurement (persisted)
     bool m_hwSlow = false;       // auto decoder: HW frames too slow to display -> software (persisted)
+    bool m_balancedSw = false;   // auto decoder: moved to CPU because the VPU is saturated (persisted)
     bool copyMode() const;
     int m_slowOutTicks = 0;
     QString m_fallbackNote;

@@ -544,6 +544,8 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
             }
+            Label { text: "Декодирование:"; opacity: 0.7 }
+            Label { text: App.decoderBalance || "—"; wrapMode: Text.Wrap; Layout.fillWidth: true; Layout.preferredWidth: 1 }
             Label { text: "Аппаратные декодеры:"; opacity: 0.7 }
             Label { text: App.hardwareDecoders; wrapMode: Text.Wrap; Layout.fillWidth: true; Layout.preferredWidth: 1 }
             Label { text: "Конфигурация:"; opacity: 0.7 }

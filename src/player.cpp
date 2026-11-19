@@ -268,6 +268,26 @@ struct PipelineCallbacks
         return GST_PAD_PROBE_OK;
     }
 
+    // Developer aid: emulates a hardware decoder shared by all streams with a
+    // total capacity of HMI_TEST_HW_FPS frames/s (used with HMI_TEST_FAKE_HW).
+    static GstPadProbeReturn hwLimitProbe(GstPad *, GstPadProbeInfo *, gpointer)
+    {
+        static QMutex mutex;
+        static qint64 nextUs = 0;
+        static const qint64 periodUs = 1000000 / qMax(1, qEnvironmentVariableIntValue("HMI_TEST_HW_FPS"));
+        qint64 slot;
+        {
+            QMutexLocker l(&mutex);
+            const qint64 now = g_get_monotonic_time();
+            slot = qMax(now, nextUs);
+            nextUs = slot + periodUs;
+        }
+        const qint64 wait = slot - g_get_monotonic_time();
+        if (wait > 0)
+            g_usleep(gulong(wait));
+        return GST_PAD_PROBE_OK;
+    }
+
     static GstPadProbeReturn countProbe(GstPad *, GstPadProbeInfo *, gpointer data)
     {
         static_cast<std::atomic<quint64> *>(data)->fetch_add(1, std::memory_order_relaxed);
@@ -364,9 +384,16 @@ struct PipelineCallbacks
         if (!decoder)
             return fail(QStringLiteral("Не найден декодер %1").arg(gsu::codecName(codec)));
 
+        // Developer aid (machines without a VPU): HMI_TEST_FAKE_HW treats the
+        // decoder chosen from the hardware list as hardware.
+        static const bool fakeHw = qEnvironmentVariableIsSet("HMI_TEST_FAKE_HW");
+        const bool isHw = gsu::isHardwareDecoder(decoderFactory)
+                          || (fakeHw && ctx->pref != gsu::DecoderPref::Software);
         if (GstPad *dsink = gst_element_get_static_pad(decoder, "sink")) {
             // Frames received from the network (statistics / traffic light).
             gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->inFrames, nullptr);
+            if (isHw && qEnvironmentVariableIsSet("HMI_TEST_HW_FPS"))
+                gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::hwLimitProbe, nullptr, nullptr);
             gst_object_unref(dsink);
             ctx->hasDecoderProbe = true;
         }
@@ -386,7 +413,7 @@ struct PipelineCallbacks
         Player *p = ctx->player;
         const quint64 g = ctx->gen;
         const QString cname = gsu::codecName(codec);
-        const bool hw = gsu::isHardwareDecoder(decoderFactory);
+        const bool hw = isHw;
         ctx->post([p, g, cname, decoderFactory, hw] { p->onDecoderSelected(g, cname, decoderFactory, hw); });
         return true;
     }
@@ -587,6 +614,7 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     if (o.value(QLatin1String("autoVersion")).toInt(0) >= 2) {
         p->m_learned = qBound(1, o.value(QLatin1String("autoOutput")).toInt(OutputGl), 3);
         p->m_hwSlow = o.value(QLatin1String("autoSoftware")).toBool(false);
+        p->m_balancedSw = o.value(QLatin1String("balancedSoftware")).toBool(false);
     }
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
@@ -621,6 +649,7 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("output"), m_output);
     o.insert(QLatin1String("autoOutput"), m_learned);
     o.insert(QLatin1String("autoSoftware"), m_hwSlow);
+    o.insert(QLatin1String("balancedSoftware"), m_balancedSw);
     o.insert(QLatin1String("autoVersion"), 2);
     return o;
 }
@@ -826,6 +855,8 @@ void Player::applyConfig(const QVariantMap &c)
     m_latency = latency;
     if (decoder != m_decoder)
         m_hwSlow = false;          // a new decoder choice is measured again
+    if (decoder != m_decoder)
+        m_balancedSw = false;
     m_decoder = decoder;
     m_lowLatency = lowLatency;
     Q_EMIT configChanged();
@@ -1069,7 +1100,7 @@ void Player::startPipeline()
     ctx->convert = m_needConvert || copyMode()
                    || qEnvironmentVariableIntValue("HMI_GL_COPY") > 0;
     ctx->debug = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
-    ctx->pref = (m_decoder == DecoderAuto && (m_hwFailed || m_hwSlow)) ? gsu::DecoderPref::Software
+    ctx->pref = (m_decoder == DecoderAuto && (m_hwFailed || m_hwSlow || m_balancedSw)) ? gsu::DecoderPref::Software
                                                          : gsu::DecoderPref(m_decoder);
     m_codec.clear();
     m_decoderName.clear();
@@ -1627,6 +1658,27 @@ bool Player::copyMode() const
 {
     const int o = m_output == OutputAuto ? m_learned : m_output;
     return o == OutputGlCopy;
+}
+
+void Player::setBalancedSoftware(bool sw)
+{
+    if (sw == m_balancedSw)
+        return;
+    m_balancedSw = sw;
+    Q_EMIT persistentChanged();
+    rebuild(sw ? QStringLiteral("Аппаратный декодер перегружен: поток переведён на программное декодирование")
+               : QStringLiteral("В аппаратном декодере есть резерв: поток возвращён на аппаратное декодирование"));
+}
+
+qreal Player::pixelRate() const
+{
+    const qreal rate = m_nominalFps > 0 ? m_nominalFps : 0;
+    return qreal(m_videoWidth) * m_videoHeight * rate;
+}
+
+bool Player::decoderLagging() const
+{
+    return m_status == Playing && m_nominalFps > 0 && m_fps < 0.85 * m_nominalFps;
 }
 
 QString Player::renderPath() const

@@ -31,6 +31,7 @@ class AppController : public QObject
     Q_PROPERTY(QString glRenderer READ glRenderer NOTIFY glInfoChanged)
     Q_PROPERTY(bool softwareRendering READ softwareRendering NOTIFY glInfoChanged)
     Q_PROPERTY(QVariantList builtinWallpapers READ builtinWallpapers CONSTANT)
+    Q_PROPERTY(QString decoderBalance READ decoderBalance NOTIFY decoderBalanceChanged)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -47,6 +48,7 @@ public:
     QString glRenderer() const { return m_glRenderer; }
     bool softwareRendering() const;
     QVariantList builtinWallpapers() const;
+    QString decoderBalance() const { return m_balanceText; }
 
     void load();
     bool listen(const QString &serverName);
@@ -66,6 +68,7 @@ Q_SIGNALS:
     void windowsChanged();
     void screensChanged();
     void glInfoChanged();
+    void decoderBalanceChanged();
 
 private:
     void addWindow(VmsWindow *w);
@@ -87,6 +90,15 @@ private:
     QElapsedTimer m_fpsClock;
     QHash<VmsWindow *, std::shared_ptr<std::atomic<int>>> m_frameCounters;
     QString m_glRenderer;
+    // Hardware decoder / CPU load balancing.
+    void balanceDecoders();
+    qreal readCpuLoad();
+    QTimer m_balanceTimer;
+    qint64 m_lastBalanceMs = 0;
+    quint64 m_cpuIdle = 0;
+    quint64 m_cpuTotal = 0;
+    qreal m_hwCapacity = 0;      // decoded pixels/s the VPU managed when saturated (persisted)
+    QString m_balanceText;
     QLocalServer *m_server = nullptr;
     bool m_quitting = false;
 };
