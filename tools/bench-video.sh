@@ -3,14 +3,21 @@
 # GPU-output variants (the same elements CAMAI VMS uses). Run inside the
 # graphical session (GL needs the display).
 #
-#   tools/bench-video.sh <stream-url> [N=8] [seconds=15]
-#   URL: http(s)://…/mpegts (best), rtsp://…
+#   tools/bench-video.sh <stream-url | file.ts> [N=8] [seconds=15]
+#   URL: http(s)://…/mpegts, rtsp://…
+#   file.ts: a recorded MPEG-TS file, played in a loop as fast as possible —
+#   measures the decoder and GPU without the network:
+#     curl -s --max-time 20 'http://server/stream/mpegts' -o ~/cam.ts
 set -u
 URL="${1:?usage: $0 <stream-url> [N] [seconds]}"
 N="${2:-8}"
 SEC="${3:-15}"
 
 src() {
+  if [ -f "$URL" ]; then
+    echo "multifilesrc location=$URL loop=true ! tsdemux ! h264parse"
+    return
+  fi
   case "$URL" in
     rtsp*) echo "rtspsrc location=$URL latency=200 ! rtph264depay ! h264parse" ;;
     *)     echo "souphttpsrc location=$URL is-live=true ! tsdemux ! h264parse" ;;
@@ -32,11 +39,15 @@ run() {   # name decoder-chain output-chain
 }
 
 GL='glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA'
-echo "Потоков: $N, длительность: $SEC с, ожидается: $N × частота кадров камеры"
+if [ -f "$URL" ]; then
+  echo "Файл $URL в $N потоках, $SEC с, без сети и без синхронизации: максимальная пропускная способность"
+else
+  echo "Потоков: $N, длительность: $SEC с, ожидается: $N × частота кадров камеры"
+fi
 echo "------------------------------------------------------------------------"
 run "1. MPP: только декодирование"            "mppvideodec"                              "identity"
 run "2. MPP → GPU (как сейчас в программе)"   "mppvideodec format=NV12"                  "$GL"
-run "3. MPP → GPU, dma-feature (DMA-BUF)"     "mppvideodec format=NV12 dma-feature=true" "$GL"
+run "3. MPP+RGA 960×540 → GPU"                "mppvideodec format=NV12 width=960 height=540" "$GL"
 run "4. MPP+RGA 640×360 → GPU"                "mppvideodec format=NV12 width=640 height=360" "$GL"
-run "5. MPP+RGA 640×360 → GPU, dma-feature"   "mppvideodec format=NV12 width=640 height=360 dma-feature=true" "$GL"
+run "5. Программный декодер: только декодирование" "avdec_h264"                           "identity"
 run "6. Программный декодер → GPU"            "avdec_h264"                               "$GL"
