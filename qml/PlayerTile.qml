@@ -155,7 +155,14 @@ Item {
                 player.attachVideoSink(objs[i], i)
         }
     }
-    Component.onCompleted: createSurface()
+    Component.onCompleted: {
+        createSurface()
+        pushViewSize()
+    }
+    // The player chooses the camera stream that suits its size on the screen.
+    function pushViewSize() { player.setViewSize(width * Screen.devicePixelRatio, height * Screen.devicePixelRatio) }
+    onWidthChanged: pushViewSize()
+    onHeightChanged: pushViewSize()
     // Automatic fallback (GL upload too slow) switches to Qt Multimedia.
     Connections {
         target: tile.player

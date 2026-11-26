@@ -7,6 +7,8 @@
 //   Qt : videoconvert(passthrough) ! appsink -> QVideoSink/VideoOutput (fallback)
 #pragma once
 
+#include <QHash>
+#include <QSet>
 #include <QJsonObject>
 #include <QMutex>
 #include <QObject>
@@ -16,6 +18,8 @@
 #include <QVideoFrame>
 
 #include <gst/gst.h>
+
+#include "streamprofile.h"
 
 #include <atomic>
 #include <functional>
@@ -94,6 +98,12 @@ class Player : public QObject
     // Each tile has two video surfaces: the shown one and the one a new
     // stream is prepared on. Index of the shown surface.
     Q_PROPERTY(int surfaceIndex READ surfaceIndex NOTIFY surfaceIndexChanged)
+    // Streams of the camera in different resolutions (persistent). The
+    // player picks the one that suits its size unless a profile is pinned.
+    Q_PROPERTY(QVariantList profiles READ profilesVariant NOTIFY profilesChanged)
+    Q_PROPERTY(QString profilePin READ profilePin NOTIFY profilesChanged)
+    // Current choice for the operator ("720p, авто: плеер 800×450 …").
+    Q_PROPERTY(QString profileText READ profileText NOTIFY profileTextChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -117,6 +127,11 @@ public:
     // frame is kept on the screen before the exchange status is shown.
     static void setWaitTimeout(int ms);
     static int waitTimeout();
+    // Automatic stream choice by player size and the frame rate floor.
+    static void setAutoQuality(bool on);
+    static bool autoQuality();
+    static void setMinFps(double fps);
+    static double minFps();
     ~Player() override;
 
     static Player *fromJson(const QJsonObject &o, QObject *parent);
@@ -227,6 +242,18 @@ public:
     QString overlayText() const;
     bool switching() const { return m_pending != nullptr; }
 
+    QVariantList profilesVariant() const;
+    QString profilePin() const { return m_profilePin; }
+    QString profileText() const { return m_profileText; }
+    const QList<StreamProfile> &profileList() const { return m_profiles; }
+    // Size of the player on the screen in device pixels (called by the tile).
+    Q_INVOKABLE void setViewSize(qreal w, qreal h);
+    // Re-evaluates the stream choice (settings changed, profiles updated).
+    void reevaluateProfile();
+    // Profiles from an external catalogue (CAMAI, ONVIF, ...): replaces the
+    // profiles of that source, keeps the others.
+    void setDiscoveredProfiles(const QString &source, const QList<StreamProfile> &list);
+
     // Video surface handling (called from QML).
     Q_INVOKABLE void attachGlItem(QQuickItem *item, int index = 0);
     Q_INVOKABLE void attachVideoSink(QVideoSink *sink, int index = 0);
@@ -255,6 +282,8 @@ Q_SIGNALS:
     void overlayChanged();
     void streamUrlChanged();
     void surfaceIndexChanged();
+    void profilesChanged();
+    void profileTextChanged();
     // The prepared stream could not be opened; the current one is kept.
     void switchFailed(const QString &url, const QString &reason);
     void switchDone(const QString &url);
@@ -283,6 +312,11 @@ private:
     void applyDecoderInfo(const QString &codec, const QString &decoder, bool hw);
     void applyVideoSize(int w, int h, int parN, int parD, int fpsN, int fpsD);
     void resetStats();
+    QString chooseUrl(QString *why = nullptr) const;
+    void evaluateProfile(bool allowDowngrade);
+    void learnProfile();
+    void setProfileText(const QString &t);
+    void probeUnknownProfiles();
     void setStatus(Status s, const QString &text = QString());
     void setActive(bool a);
     void scheduleGlReady(int index);
@@ -374,6 +408,17 @@ private:
     int m_slowOutTicks = 0;
     QString m_fallbackNote;
     int m_retry = 0;
+    // stream profiles
+    QList<StreamProfile> m_profiles;
+    QString m_profilePin;               // "" automatic, otherwise URL of the pinned profile
+    QString m_profileText;
+    qreal m_viewW = 0;
+    qreal m_viewH = 0;
+    QTimer m_selectTimer;               // debounce of size changes
+    QTimer m_downgradeTimer;            // a smaller stream only after the size is stable
+    QString m_downTarget;
+    QHash<QString, qint64> m_failedUntil;   // URL -> ms epoch (switch failed)
+    QSet<QString> m_probed;             // profiles whose parameters were requested
     QString m_lastError;        // shown while reconnecting
     QString m_stage;            // exchange status of the connecting stream
     QString m_pendingStage;     // ... of the prepared stream

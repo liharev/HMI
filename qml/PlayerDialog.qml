@@ -11,6 +11,12 @@ Dialog {
     property VmsWindow win
     property Player player: null
 
+    // Streams of the camera (profiles) being edited: list of maps.
+    property var profs: []
+    property string pin: ""
+    property var probing: ({})           // probe id -> url
+    property int probesRunning: 0
+
     FontMetrics { id: fm; font: dlg.font }
     readonly property real em: fm.height
 
@@ -39,6 +45,11 @@ Dialog {
         flipHCheck.checked = !!c.flipH
         flipVCheck.checked = !!c.flipV
         outputBox.currentIndex = c.output !== undefined ? c.output : 0
+        profs = (c.profiles || []).map(x => Object.assign({}, x))
+        pin = c.profilePin || ""
+        probing = ({})
+        probesRunning = 0
+        newProfileField.text = ""
         scroll.ScrollBar.vertical.position = 0
         open()
         urlField.forceActiveFocus()
@@ -60,13 +71,89 @@ Dialog {
             rotation: rotationBox.currentIndex * 90,
             flipH: flipHCheck.checked,
             flipV: flipVCheck.checked,
-            output: outputBox.currentIndex
+            output: outputBox.currentIndex,
+            profiles: profs,
+            profilePin: pinBox.currentIndex > 0 ? profs[pinBox.currentIndex - 1].url : ""
         }
         if (player)
             player.applyConfig(cfg)
         else
             win.addPlayer(cfg)
         close()
+    }
+
+    function profileIndex(u) {
+        for (let i = 0; i < profs.length; ++i)
+            if (profs[i].url === u)
+                return i
+        return -1
+    }
+    // What the player already knows about the stream it plays.
+    function learned(u) {
+        const p = player
+        if (!p || p.streamUrl !== u || p.videoWidth <= 0)
+            return { url: u }
+        const codec = p.codec === "H.264" ? "h264" : p.codec === "H.265" ? "h265" : p.codec === "MJPEG" ? "jpeg" : ""
+        return { url: u, width: p.videoWidth, height: p.videoHeight, fps: p.nominalFps, codec: codec,
+                 description: p.videoWidth + "×" + p.videoHeight + (p.nominalFps > 0 ? " · " + Math.round(p.nominalFps) + " к/с" : "")
+                              + (p.codec ? " · " + p.codec : "") }
+    }
+    function addProfile(u) {
+        u = u.trim()
+        if (!u.length)
+            return
+        const list = profs.slice()
+        // The main address is one of the streams too.
+        if (list.length === 0 && url_.length && url_ !== u)
+            list.push(Object.assign({ label: "основной" }, learned(url_)))
+        if (profileIndex(u) < 0 && !list.some(x => x.url === u))
+            list.push(learned(u))
+        profs = list
+        probeAll()
+    }
+    function removeProfile(i) {
+        const list = profs.slice()
+        if (pinBox.currentIndex - 1 === i)
+            pin = ""
+        list.splice(i, 1)
+        profs = list
+    }
+    function probeAll() {
+        for (let i = 0; i < profs.length; ++i) {
+            if (profs[i].width > 0 && profs[i].codec)
+                continue
+            const id = App.probeStream(profs[i].url, userField.text, passField.text)
+            const m = Object.assign({}, probing)
+            m[id] = profs[i].url
+            probing = m
+            ++probesRunning
+        }
+    }
+    function forceProbeAll() {
+        const list = profs.map(x => ({ url: x.url, label: x.label || "", kind: x.kind || "", source: x.source || "" }))
+        profs = list
+        probeAll()
+    }
+    Connections {
+        target: App
+        function onProbeFinished(id, profile, error) {
+            const u = dlg.probing[id]
+            if (u === undefined)
+                return
+            const m = Object.assign({}, dlg.probing)
+            delete m[id]
+            dlg.probing = m
+            dlg.probesRunning = Math.max(0, dlg.probesRunning - 1)
+            const i = dlg.profileIndex(u)
+            if (i < 0)
+                return
+            const list = dlg.profs.slice()
+            const old = list[i]
+            list[i] = error ? Object.assign({}, old, { error: error })
+                            : Object.assign({}, profile, { label: old.label || "", kind: old.kind || "",
+                                                           source: old.source || "probe" })
+            dlg.profs = list
+        }
     }
 
     readonly property string url_: urlField.text.trim()
@@ -233,6 +320,97 @@ Dialog {
                 text: (dlg.player ? "Сейчас: " + dlg.player.renderPath + ". " : "")
                       + "В режиме «Авто» плеер сам переходит на другой способ, если кадры не успевают "
                       + "попадать на экран, и запоминает его."
+            }
+
+            Section { text: "Качество: потоки камеры" }
+
+            Item { implicitWidth: 1; implicitHeight: 1 }
+            Hint {
+                text: "Если камера отдаёт несколько потоков (например, 4K, 1080p и 360p), перечислите их: "
+                      + "плеер сам выберет самый лёгкий поток, которого достаточно для его размера на экране, "
+                      + "и переключится без чёрного экрана при изменении размера. Список CAMAI, ONVIF и "
+                      + "Flussonic заполняется автоматически."
+            }
+
+            Repeater {
+                model: dlg.profs
+                delegate: RowLayout {
+                    required property var modelData
+                    required property int index
+                    Layout.columnSpan: 2
+                    Layout.fillWidth: true
+                    spacing: Math.round(dlg.em * 0.4)
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Label {
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            text: (modelData.label ? modelData.label + ": " : "") + modelData.url
+                            font.bold: !!(dlg.player && dlg.player.streamUrl === modelData.url)
+                        }
+                        Hint {
+                            Layout.fillWidth: true
+                            color: modelData.error ? "#fca5a5" : palette.windowText
+                            text: {
+                                const probingNow = Object.values(dlg.probing).indexOf(modelData.url) >= 0
+                                if (probingNow) return "определение параметров…"
+                                if (modelData.error) return "ошибка: " + modelData.error
+                                let t = modelData.description || "параметры неизвестны — нажмите «Определить параметры»"
+                                if (modelData.kind === "preview") t += " · превью по запросу"
+                                if (dlg.player && dlg.player.streamUrl === modelData.url) t += " · воспроизводится"
+                                return t
+                            }
+                        }
+                    }
+                    ToolButton {
+                        text: "✕"
+                        onClicked: dlg.removeProfile(index)
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Убрать поток из списка"
+                    }
+                }
+            }
+
+            Label { text: "Добавить поток" }
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.preferredWidth: dlg.em * 4
+                Field {
+                    id: newProfileField
+                    placeholderText: "адрес другого потока камеры"
+                    onAccepted: { dlg.addProfile(text); text = "" }
+                }
+                Button {
+                    text: "Добавить"
+                    enabled: newProfileField.text.trim().length > 0
+                    onClicked: { dlg.addProfile(newProfileField.text); newProfileField.text = "" }
+                }
+            }
+
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.profs.length > 0 }
+            Button {
+                visible: dlg.profs.length > 0
+                text: dlg.probesRunning > 0 ? "Определение… (" + dlg.probesRunning + ")" : "Определить параметры"
+                enabled: dlg.probesRunning === 0
+                onClicked: dlg.forceProbeAll()
+            }
+
+            Label { text: "Выбор потока"; visible: dlg.profs.length > 0 }
+            ComboBox {
+                id: pinBox
+                visible: dlg.profs.length > 0
+                Layout.fillWidth: true
+                Layout.preferredWidth: dlg.em * 4
+                model: ["Автоматически по размеру плеера"].concat(
+                           dlg.profs.map(x => (x.label ? x.label + ": " : "") + (x.description || x.url)))
+                currentIndex: Math.max(0, dlg.profileIndex(dlg.pin) + 1)
+                onActivated: (i) => dlg.pin = i > 0 ? dlg.profs[i - 1].url : ""
+            }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.profs.length > 0 && dlg.player }
+            Hint {
+                visible: dlg.profs.length > 0 && !!dlg.player
+                text: dlg.player ? (dlg.player.profileText || "") : ""
             }
 
             Section { text: "Изображение" }

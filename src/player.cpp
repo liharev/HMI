@@ -36,12 +36,18 @@
 namespace {
 bool g_glRendering = false;
 int g_waitMs = 3000;
+bool g_autoQuality = true;
+double g_minFps = 10;
 } // namespace
 
 void Player::setGlRendering(bool on) { g_glRendering = on; }
 bool Player::glRendering() { return g_glRendering; }
 void Player::setWaitTimeout(int ms) { g_waitMs = qBound(500, ms, 60000); }
 int Player::waitTimeout() { return g_waitMs; }
+void Player::setAutoQuality(bool on) { g_autoQuality = on; }
+bool Player::autoQuality() { return g_autoQuality; }
+void Player::setMinFps(double fps) { g_minFps = qBound(0.0, fps, 60.0); }
+double Player::minFps() { return g_minFps; }
 
 // ---------------------------------------------------------------------------
 // Shared state between the GUI-thread Player and GStreamer streaming threads.
@@ -227,9 +233,12 @@ struct PipelineCallbacks
             const QString text = QString::fromUtf8(err ? err->message : "unknown error");
             qWarning("[%s] error from %s: %s (%s)", qPrintable(ctx->name),
                      GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), qPrintable(text), dbg ? dbg : "");
+            // The details (e.g. the RTSP status "Service Unavailable (503)")
+            // are often only in the debug part: both go to the explanation.
+            const QString details = QString::fromUtf8(dbg ? dbg : "");
             g_clear_error(&err);
             g_free(dbg);
-            ctx->postError(text);
+            ctx->postError(details.isEmpty() ? text : text + QLatin1Char('\n') + details);
             break;
         }
         case GST_MESSAGE_EOS:
@@ -645,6 +654,23 @@ Player::Player(QObject *parent)
         m_waitExpired = true;
         Q_EMIT overlayChanged();
     });
+    // Stream choice: evaluated 0.5 s after the size settled; a smaller
+    // stream only if the player stays small for 5 s (no flapping, and the
+    // camera does not restart encoders on every resize).
+    m_selectTimer.setSingleShot(true);
+    m_selectTimer.setInterval(500);
+    connect(&m_selectTimer, &QTimer::timeout, this, [this] { evaluateProfile(false); });
+    m_downgradeTimer.setSingleShot(true);
+    m_downgradeTimer.setInterval(5000);
+    connect(&m_downgradeTimer, &QTimer::timeout, this, [this] { evaluateProfile(true); });
+    connect(this, &Player::orientationChanged, this, [this] { m_selectTimer.start(); });
+    connect(this, &Player::streamUrlChanged, this, &Player::profilesChanged);   // "active" marks
+    connect(this, &Player::switchFailed, this, [this](const QString &url, const QString &) {
+        // Do not ask for this stream again for a minute; try the next best.
+        m_failedUntil.insert(url, QDateTime::currentMSecsSinceEpoch() + 60000);
+        QTimer::singleShot(61000, this, [this] { m_selectTimer.start(); });
+        evaluateProfile(true);
+    });
 }
 
 Player::~Player()
@@ -685,6 +711,12 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
         p->m_hwSlow = o.value(QLatin1String("autoSoftware")).toBool(false);
         p->m_balancedSw = o.value(QLatin1String("balancedSoftware")).toBool(false);
     }
+    for (const QJsonValue &v : o.value(QLatin1String("profiles")).toArray()) {
+        const StreamProfile sp = StreamProfile::fromJson(v.toObject());
+        if (!sp.url.isEmpty() && profiles::indexOf(p->m_profiles, sp.url) < 0)
+            p->m_profiles << sp;
+    }
+    p->m_profilePin = o.value(QLatin1String("profilePin")).toString();
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -720,6 +752,14 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("autoSoftware"), m_hwSlow);
     o.insert(QLatin1String("balancedSoftware"), m_balancedSw);
     o.insert(QLatin1String("autoVersion"), 2);
+    if (!m_profiles.isEmpty()) {
+        QJsonArray arr;
+        for (const StreamProfile &sp : m_profiles)
+            arr.append(sp.toJson());
+        o.insert(QLatin1String("profiles"), arr);
+    }
+    if (!m_profilePin.isEmpty())
+        o.insert(QLatin1String("profilePin"), m_profilePin);
     return o;
 }
 
@@ -880,6 +920,8 @@ QVariantMap Player::config() const
         {QStringLiteral("rotation"), m_rotation},
         {QStringLiteral("flipH"), m_flipH},
         {QStringLiteral("flipV"), m_flipV},
+        {QStringLiteral("profiles"), profilesVariant()},
+        {QStringLiteral("profilePin"), m_profilePin},
     };
 }
 
@@ -912,6 +954,34 @@ void Player::applyConfig(const QVariantMap &c)
     setFlipV(c.value(QStringLiteral("flipV"), m_flipV).toBool());
 
     const bool urlChanged = url != m_url;
+    bool profilesEdited = false;
+    if (c.contains(QStringLiteral("profiles"))) {
+        QList<StreamProfile> list;
+        for (const QVariant &v : c.value(QStringLiteral("profiles")).toList()) {
+            const StreamProfile sp = StreamProfile::fromVariant(v.toMap());
+            if (!sp.url.isEmpty() && profiles::indexOf(list, sp.url) < 0)
+                list << sp;
+        }
+        QStringList before, after;
+        for (const StreamProfile &sp : m_profiles)
+            before << QJsonDocument(sp.toJson()).toJson(QJsonDocument::Compact);
+        for (const StreamProfile &sp : list)
+            after << QJsonDocument(sp.toJson()).toJson(QJsonDocument::Compact);
+        if (before != after) {
+            m_profiles = list;
+            m_failedUntil.clear();
+            profilesEdited = true;
+        }
+    }
+    if (c.contains(QStringLiteral("profilePin"))) {
+        const QString pin = c.value(QStringLiteral("profilePin")).toString();
+        if (pin != m_profilePin) {
+            m_profilePin = pin;
+            profilesEdited = true;
+        }
+    }
+    if (profilesEdited)
+        Q_EMIT profilesChanged();
     const bool otherStreamChanged = user != m_username || pass != m_password
                                     || transport != m_transport || latency != m_latency
                                     || decoder != m_decoder || lowLatency != m_lowLatency;
@@ -934,13 +1004,15 @@ void Player::applyConfig(const QVariantMap &c)
     if (otherStreamChanged || outputChanged) {
         m_streamUrl = m_url;
         restart();
-    } else if (urlChanged) {
-        // Only the address changed: open the new stream while the old one
-        // is still shown.
-        if (m_active)
+    } else if (urlChanged || profilesEdited) {
+        // Only the address / the stream list changed: open the new stream
+        // while the old one is still shown.
+        if (m_profiles.isEmpty() && !m_active)
+            m_streamUrl = m_url;
+        else if (m_profiles.isEmpty())
             switchStream(m_url, QStringLiteral("изменён адрес потока"));
         else
-            m_streamUrl = m_url;
+            evaluateProfile(true);
     }
 }
 
@@ -1240,8 +1312,18 @@ void Player::startPipeline()
     m_decoderName.clear();
     m_hwDecoding = false;
     Q_EMIT videoInfoChanged();
-    if (m_streamUrl.isEmpty())
-        m_streamUrl = m_url;
+    {
+        QString why;
+        const QString chosen = m_profiles.isEmpty() ? (m_streamUrl.isEmpty() ? m_url : m_streamUrl) : chooseUrl(&why);
+        if (chosen != m_streamUrl) {
+            m_streamUrl = chosen;
+            Q_EMIT streamUrlChanged();
+        }
+        if (!m_profiles.isEmpty()) {
+            qInfo("[%s] stream %s (%s)", qPrintable(m_name), qPrintable(chosen), qPrintable(why));
+            probeUnknownProfiles();
+        }
+    }
 
     QString err;
     PipelineCtx *ctx = buildPipeline(m_streamUrl, false, &err);
@@ -1938,6 +2020,11 @@ void Player::scheduleRetry(const QString &reason)
         ++m_retry;
     }
     m_lastError = text;
+    if (!m_gotFrame && m_retry >= 2 && m_profiles.size() > 1 && m_profilePin.isEmpty()) {
+        // This stream of the camera does not work: use another one for a while.
+        m_failedUntil.insert(m_streamUrl, QDateTime::currentMSecsSinceEpoch() + 60000);
+        QTimer::singleShot(61000, this, [this] { m_selectTimer.start(); });
+    }
     if (m_pending && m_active && !m_suspended) {
         // The shown stream failed while another one is being prepared: the
         // prepared one takes over at once.
@@ -2212,11 +2299,13 @@ void Player::updateHealth()
 static QString explainError(const QString &msg)
 {
     static const struct { const char *needle; const char *text; } map[] = {
+        {"Service Unavailable", "Сервер временно не отдаёт поток (503)"},
+        {"(503)", "Сервер временно не отдаёт поток (503)"},
         {"Unauthorized", "Ошибка авторизации: проверьте логин и пароль"},
-        {"401", "Ошибка авторизации: проверьте логин и пароль"},
-        {"403", "Доступ запрещён (403)"},
+        {"(401)", "Ошибка авторизации: проверьте логин и пароль"},
+        {"(403)", "Доступ запрещён (403)"},
         {"Not Found", "Поток не найден (404): проверьте адрес"},
-        {"404", "Поток не найден (404): проверьте адрес"},
+        {"(404)", "Поток не найден (404): проверьте адрес"},
         {"Could not open resource", "Не удалось подключиться к источнику"},
         {"Could not resolve", "Не удалось найти сервер по имени"},
         {"Could not read from resource", "Ошибка чтения из источника"},
@@ -2227,7 +2316,7 @@ static QString explainError(const QString &msg)
     for (const auto &m : map)
         if (msg.contains(QLatin1String(m.needle), Qt::CaseInsensitive))
             return QString::fromUtf8(m.text);
-    return msg;
+    return msg.section(QLatin1Char('\n'), 0, 0);    // without the debug details
 }
 
 void Player::onPipelineError(quint64 gen, const QString &msg)
@@ -2264,6 +2353,7 @@ void Player::applyDecoderInfo(const QString &codec, const QString &decoder, bool
     m_decoderName = decoder;
     m_hwDecoding = hw;
     Q_EMIT videoInfoChanged();
+    learnProfile();
 }
 
 void Player::onVideoSize(quint64 gen, int w, int h, int parN, int parD, int fpsN, int fpsD)
@@ -2288,8 +2378,10 @@ void Player::applyVideoSize(int w, int h, int parN, int parD, int fpsN, int fpsD
     m_nominalFps = (fpsN > 0 && fpsD > 0) ? qreal(fpsN) / fpsD : 0;
     if (parN > 0 && parD > 0 && parN != parD)
         w = int(qint64(w) * parN / parD);
-    if (w == m_videoWidth && h == m_videoHeight)
+    if (w == m_videoWidth && h == m_videoHeight) {
+        learnProfile();
         return;
+    }
     const qreal oldAspect = aspect();
     m_videoWidth = w;
     m_videoHeight = h;
@@ -2299,6 +2391,7 @@ void Player::applyVideoSize(int w, int h, int parN, int parD, int fpsN, int fpsD
         Q_EMIT geometryChanged();
         Q_EMIT persistentChanged();
     }
+    learnProfile();
 }
 
 void Player::onFirstFrame(quint64 gen)
@@ -2314,6 +2407,224 @@ void Player::onFirstFrame(quint64 gen)
     m_lastError.clear();
     endWait();
     setStatus(Playing, QString());
+}
+
+// ---------------------------------------------------------------------------
+// Stream profiles: automatic choice by the player size
+// ---------------------------------------------------------------------------
+QVariantList Player::profilesVariant() const
+{
+    QVariantList out;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (const StreamProfile &sp : m_profiles) {
+        QVariantMap m = sp.toVariant();
+        m.insert(QStringLiteral("active"), sp.url == m_streamUrl);
+        m.insert(QStringLiteral("failed"), m_failedUntil.value(sp.url) > now);
+        out << m;
+    }
+    return out;
+}
+
+void Player::setViewSize(qreal w, qreal h)
+{
+    if (qAbs(w - m_viewW) < 2 && qAbs(h - m_viewH) < 2)
+        return;
+    m_viewW = w;
+    m_viewH = h;
+    if (!m_profiles.isEmpty())
+        m_selectTimer.start();
+}
+
+void Player::reevaluateProfile()
+{
+    if (!m_profiles.isEmpty())
+        evaluateProfile(true);
+}
+
+QString Player::chooseUrl(QString *why) const
+{
+    if (m_profiles.isEmpty())
+        return m_url;
+    if (!m_profilePin.isEmpty() && profiles::indexOf(m_profiles, m_profilePin) >= 0) {
+        if (why)
+            *why = QStringLiteral("закреплён вручную");
+        return m_profilePin;
+    }
+    if (!g_autoQuality) {
+        if (why)
+            *why = QStringLiteral("автовыбор выключен в настройках программы");
+        return m_url.isEmpty() ? m_profiles.first().url : m_url;
+    }
+    ProfileRequest r;
+    // A picture turned by 90° fills the player with its width along the height.
+    const bool swap = m_rotation % 180 == 90;
+    r.boxWidth = swap ? m_viewH : m_viewW;
+    r.boxHeight = swap ? m_viewW : m_viewH;
+    r.minFps = g_minFps;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for (auto it = m_failedUntil.cbegin(); it != m_failedUntil.cend(); ++it)
+        if (it.value() > now)
+            r.excluded.insert(it.key());
+    const int i = profiles::select(m_profiles, r, why);
+    return i >= 0 ? m_profiles[i].url : m_url;
+}
+
+// Profiles entered without parameters are examined in the background (once
+// per session), so that the automatic choice can use them.
+void Player::probeUnknownProfiles()
+{
+    for (const StreamProfile &sp : std::as_const(m_profiles)) {
+        if (sp.known() || m_probed.contains(sp.url))
+            continue;
+        m_probed.insert(sp.url);
+        const QString url = sp.url;
+        profiles::probe(resolveUrl(url, nullptr).toString(QUrl::FullyEncoded), m_username, m_password, this,
+                        [this, url](const StreamProfile &r, const QString &error) {
+            const int i = profiles::indexOf(m_profiles, url);
+            if (i < 0)
+                return;
+            if (!error.isEmpty() || !r.known()) {
+                qInfo("[%s] stream %s: parameters unknown (%s)", qPrintable(m_name), qPrintable(url), qPrintable(error));
+                return;
+            }
+            StreamProfile &sp = m_profiles[i];
+            sp.width = r.width;
+            sp.height = r.height;
+            if (r.fps > 0) sp.fps = r.fps;
+            if (!r.codec.isEmpty()) sp.codec = r.codec;
+            if (r.bitrateKbps > 0 && sp.bitrateKbps <= 0) sp.bitrateKbps = r.bitrateKbps;
+            if (r.audio >= 0) sp.audio = r.audio;
+            qInfo("[%s] stream %s: %s", qPrintable(m_name), qPrintable(url), qPrintable(sp.describe()));
+            Q_EMIT profilesChanged();
+            Q_EMIT persistentChanged();
+            m_selectTimer.start();
+        });
+    }
+}
+
+void Player::setProfileText(const QString &t)
+{
+    if (t == m_profileText)
+        return;
+    m_profileText = t;
+    Q_EMIT profileTextChanged();
+}
+
+void Player::evaluateProfile(bool allowDowngrade)
+{
+    if (m_profiles.isEmpty()) {
+        setProfileText(QString());
+        return;
+    }
+    if (m_active)
+        probeUnknownProfiles();
+    QString why;
+    const QString target = chooseUrl(&why);
+    const int ti = profiles::indexOf(m_profiles, target);
+    if (ti >= 0) {
+        const StreamProfile &tp = m_profiles[ti];
+        setProfileText((m_profilePin.isEmpty() ? QStringLiteral("Авто: ") : QStringLiteral("Вручную: "))
+                       + (tp.label.isEmpty() ? tp.describe() : tp.label + QStringLiteral(" (") + tp.describe() + QLatin1Char(')')));
+    }
+    if (!m_active || m_suspended || target.isEmpty())
+        return;
+    if (target == m_streamUrl) {
+        m_downgradeTimer.stop();
+        if (m_pending)
+            switchStream(target);          // cancels a no longer wanted switch
+        return;
+    }
+    if (m_pending && m_pending->url == target) {
+        m_downgradeTimer.stop();
+        return;
+    }
+    if (!m_ctx && !m_pending) {
+        // Not running yet (or between reconnects): used at the next start.
+        m_streamUrl = target;
+        Q_EMIT streamUrlChanged();
+        return;
+    }
+    const int ci = profiles::indexOf(m_profiles, m_streamUrl);
+    bool upgrade = ci < 0 || !m_profiles[ci].known() || ti < 0 || !m_profilePin.isEmpty();
+    if (!upgrade) {
+        const StreamProfile &cp = m_profiles[ci];
+        const StreamProfile &tp = m_profiles[ti];
+        const double ca = double(cp.width) * cp.height, ta = double(tp.width) * tp.height;
+        upgrade = ta > ca * 1.01 || (ta > ca * 0.99 && tp.fps > cp.fps + 0.5);
+    }
+    if (upgrade || allowDowngrade || m_status != Playing) {
+        m_downgradeTimer.stop();
+        switchStream(target, why);
+    } else if (!m_downgradeTimer.isActive() || m_downTarget != target) {
+        m_downTarget = target;
+        m_downgradeTimer.start();
+    }
+}
+
+// The parameters of the profile being played are corrected from the real
+// stream (catalogues and manual entries may be inexact or empty).
+void Player::learnProfile()
+{
+    const int i = profiles::indexOf(m_profiles, m_streamUrl);
+    if (i < 0)
+        return;
+    StreamProfile &sp = m_profiles[i];
+    bool changed = false;
+    if (m_videoWidth > 0 && m_videoHeight > 0 && (sp.width != m_videoWidth || sp.height != m_videoHeight)) {
+        sp.width = m_videoWidth;
+        sp.height = m_videoHeight;
+        changed = true;
+    }
+    if (m_nominalFps > 0 && qAbs(sp.fps - m_nominalFps) > 0.5) {
+        sp.fps = qRound(m_nominalFps * 100) / 100.0;
+        changed = true;
+    }
+    QString codec = m_codec == QLatin1String("H.264") ? QStringLiteral("h264")
+                  : m_codec == QLatin1String("H.265") ? QStringLiteral("h265")
+                  : m_codec == QLatin1String("MJPEG") ? QStringLiteral("jpeg") : QString();
+    if (!codec.isEmpty() && sp.codec != codec) {
+        sp.codec = codec;
+        changed = true;
+    }
+    if (!changed)
+        return;
+    Q_EMIT profilesChanged();
+    Q_EMIT persistentChanged();
+    m_selectTimer.start();
+}
+
+void Player::setDiscoveredProfiles(const QString &source, const QList<StreamProfile> &list)
+{
+    QList<StreamProfile> merged;
+    for (const StreamProfile &sp : list) {
+        StreamProfile n = sp;
+        n.source = source;
+        // Keep what was learned from playback when the catalogue has no value.
+        const int old = profiles::indexOf(m_profiles, sp.url);
+        if (old >= 0) {
+            const StreamProfile &o = m_profiles[old];
+            if (!n.known()) { n.width = o.width; n.height = o.height; }
+            if (n.fps <= 0) n.fps = o.fps;
+            if (n.codec.isEmpty()) n.codec = o.codec;
+            if (n.audio < 0) n.audio = o.audio;
+        }
+        if (profiles::indexOf(merged, n.url) < 0)
+            merged << n;
+    }
+    for (const StreamProfile &sp : m_profiles)
+        if (sp.source != source && profiles::indexOf(merged, sp.url) < 0)
+            merged << sp;
+    QStringList before, after;
+    for (const StreamProfile &sp : m_profiles)
+        before << QJsonDocument(sp.toJson()).toJson(QJsonDocument::Compact);
+    for (const StreamProfile &sp : merged)
+        after << QJsonDocument(sp.toJson()).toJson(QJsonDocument::Compact);
+    if (before == after)
+        return;
+    m_profiles = merged;
+    Q_EMIT profilesChanged();
+    Q_EMIT persistentChanged();
+    m_selectTimer.start();
 }
 
 // ---------------------------------------------------------------------------

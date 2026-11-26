@@ -15,7 +15,8 @@ find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multi
 find_package(Qt6 6.4 QUIET OPTIONAL_COMPONENTS WebSockets)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GST REQUIRED IMPORTED_TARGET
-    gstreamer-1.0>=1.20 gstreamer-video-1.0>=1.20 gstreamer-app-1.0>=1.20)
+    gstreamer-1.0>=1.20 gstreamer-video-1.0>=1.20 gstreamer-app-1.0>=1.20
+    gstreamer-pbutils-1.0>=1.20)
 
 qt_standard_project_setup()
 
@@ -23,6 +24,7 @@ qt_add_executable(hmi-vms
     src/main.cpp
     src/gstutils.h src/gstutils.cpp
     src/player.h src/player.cpp
+    src/streamprofile.h src/streamprofile.cpp
     src/vmswindow.h src/vmswindow.cpp
     src/appcontroller.h src/appcontroller.cpp
     src/diagnostics.h src/diagnostics.cpp

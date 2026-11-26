@@ -41,6 +41,10 @@ class AppController : public QObject
     // Waiting for the video stream: the last frame is kept this long before
     // the exchange status is shown over the player.
     Q_PROPERTY(int streamWaitMs READ streamWaitMs WRITE setStreamWaitMs NOTIFY settingsChanged)
+    // Automatic choice of the camera stream by the player size, and the
+    // lowest frame rate the choice may go to.
+    Q_PROPERTY(bool autoQuality READ autoQuality WRITE setAutoQuality NOTIFY settingsChanged)
+    Q_PROPERTY(double minTileFps READ minTileFps WRITE setMinTileFps NOTIFY settingsChanged)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -61,6 +65,13 @@ public:
     Diagnostics *diag() const { return m_diag; }
     int streamWaitMs() const;
     void setStreamWaitMs(int ms);
+    bool autoQuality() const;
+    void setAutoQuality(bool on);
+    double minTileFps() const;
+    void setMinTileFps(double fps);
+    // Reads resolution / frame rate / codec / audio of a stream (async);
+    // the result comes with probeFinished(id, ...).
+    Q_INVOKABLE int probeStream(const QString &url, const QString &user, const QString &password);
     QList<Player *> allPlayers() const;
     QString decoderEnvironment() const;   // kernel + available hardware decoders
     bool balanceOff() const { return m_balanceOff; }
@@ -86,6 +97,7 @@ Q_SIGNALS:
     void glInfoChanged();
     void decoderBalanceChanged();
     void settingsChanged();
+    void probeFinished(int id, const QVariantMap &profile, const QString &error);
 
 private:
     void addWindow(VmsWindow *w);
@@ -122,4 +134,6 @@ private:
     QPointer<QQuickWindow> m_diagView;
     QLocalServer *m_server = nullptr;
     bool m_quitting = false;
+    int m_probeId = 0;
+    void settingsUpdated();
 };

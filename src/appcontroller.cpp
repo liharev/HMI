@@ -2,6 +2,8 @@
 #include "diagnostics.h"
 #include "gstutils.h"
 #include "player.h"
+#include "streamprofile.h"
+#include <QUrl>
 #include "vmswindow.h"
 
 #include <QDir>
@@ -305,6 +307,8 @@ void AppController::load()
         m_hwCapacity = root.value(QLatin1String("hwCapacity")).toDouble(0);
         const QJsonObject settings = root.value(QLatin1String("settings")).toObject();
         Player::setWaitTimeout(settings.value(QLatin1String("streamWaitMs")).toInt(3000));
+        Player::setAutoQuality(settings.value(QLatin1String("autoQuality")).toBool(true));
+        Player::setMinFps(settings.value(QLatin1String("minTileFps")).toDouble(10));
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
         // Automatic decisions are only valid for the environment they were
@@ -617,6 +621,52 @@ void AppController::setStreamWaitMs(int ms)
     scheduleSave();
 }
 
+bool AppController::autoQuality() const
+{
+    return Player::autoQuality();
+}
+
+void AppController::setAutoQuality(bool on)
+{
+    if (on == Player::autoQuality())
+        return;
+    Player::setAutoQuality(on);
+    settingsUpdated();
+}
+
+double AppController::minTileFps() const
+{
+    return Player::minFps();
+}
+
+void AppController::setMinTileFps(double fps)
+{
+    if (qFuzzyCompare(fps + 1, Player::minFps() + 1))
+        return;
+    Player::setMinFps(fps);
+    settingsUpdated();
+}
+
+void AppController::settingsUpdated()
+{
+    Q_EMIT settingsChanged();
+    scheduleSave();
+    for (Player *p : allPlayers())
+        p->reevaluateProfile();
+}
+
+int AppController::probeStream(const QString &url, const QString &user, const QString &password)
+{
+    const int id = ++m_probeId;
+    const QString resolved = Player::resolveUrl(url, nullptr).toString(QUrl::FullyEncoded);
+    profiles::probe(resolved, user, password, this, [this, id, url](const StreamProfile &p, const QString &err) {
+        StreamProfile r = p;
+        r.url = url;                   // as typed (aliases such as m4f:// stay)
+        Q_EMIT probeFinished(id, r.toVariant(), err);
+    });
+    return id;
+}
+
 void AppController::save()
 {
     m_saveTimer.stop();
@@ -625,7 +675,9 @@ void AppController::save()
         arr.append(w->toJson());
     QJsonObject root{{QStringLiteral("version"), 1}, {QStringLiteral("windows"), arr},
                      {QStringLiteral("hwCapacity"), m_hwCapacity},
-                     {QStringLiteral("settings"), QJsonObject{{QStringLiteral("streamWaitMs"), Player::waitTimeout()}}},
+                     {QStringLiteral("settings"), QJsonObject{{QStringLiteral("streamWaitMs"), Player::waitTimeout()},
+                                                              {QStringLiteral("autoQuality"), Player::autoQuality()},
+                                                              {QStringLiteral("minTileFps"), Player::minFps()}}},
                      {QStringLiteral("decoderEnv"), decoderEnvironment()}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);
