@@ -31,13 +31,17 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <memory>
 
 namespace {
 bool g_glRendering = false;
+int g_waitMs = 3000;
 } // namespace
 
 void Player::setGlRendering(bool on) { g_glRendering = on; }
 bool Player::glRendering() { return g_glRendering; }
+void Player::setWaitTimeout(int ms) { g_waitMs = qBound(500, ms, 60000); }
+int Player::waitTimeout() { return g_waitMs; }
 
 // ---------------------------------------------------------------------------
 // Shared state between the GUI-thread Player and GStreamer streaming threads.
@@ -67,6 +71,17 @@ struct PipelineCtx
     bool debug = false;
     std::atomic<qint64> lastFrameUs{0};  // monotonic time of the last decoded frame
     std::atomic<bool> hasDecoderProbe{false};
+
+    QString url;                   // address played by this pipeline
+    QString host;                  // host[:port] for status texts
+    bool pending = false;          // prepared stream: output blocked until activation
+    GstElement *sink = nullptr;    // video sink (owned by the pipeline)
+    int surface = 0;               // index of the tile surface drawn on
+    int stallLimit = 10;           // seconds without frames before reconnect
+    // Stream information of a pending pipeline, applied on activation (GUI thread).
+    QString codec, decoder;
+    bool hw = false, hasDecoder = false, hasSize = false;
+    int w = 0, h = 0, parN = 1, parD = 1, fpsN = 0, fpsD = 1;
 
     QMutex mutex;
     bool alive = true;
@@ -220,6 +235,33 @@ struct PipelineCallbacks
         case GST_MESSAGE_EOS:
             ctx->postError(QStringLiteral("Поток завершён сервером"));
             break;
+        case GST_MESSAGE_PROGRESS: {
+            // rtspsrc reports the steps of the RTSP exchange.
+            GstProgressType type;
+            gchar *code = nullptr;
+            gchar *text = nullptr;
+            gst_message_parse_progress(msg, &type, &code, &text);
+            QString stage;
+            const bool running = type == GST_PROGRESS_TYPE_START || type == GST_PROGRESS_TYPE_CONTINUE;
+            if (running && !g_strcmp0(code, "connect"))
+                stage = QStringLiteral("Подключение к %1…").arg(ctx->host);
+            else if (running && !g_strcmp0(code, "open"))
+                stage = QStringLiteral("%1: запрос описания потока…").arg(ctx->host);
+            else if (type == GST_PROGRESS_TYPE_COMPLETE && !g_strcmp0(code, "open"))
+                stage = QStringLiteral("%1: поток открыт, запрос воспроизведения…").arg(ctx->host);
+            else if (running && !g_strcmp0(code, "request"))
+                stage = QStringLiteral("%1: запрос воспроизведения…").arg(ctx->host);
+            else if (type == GST_PROGRESS_TYPE_COMPLETE && !g_strcmp0(code, "request"))
+                stage = QStringLiteral("%1: сервер начал передачу, ожидание видеоданных…").arg(ctx->host);
+            g_free(code);
+            g_free(text);
+            if (!stage.isEmpty()) {
+                Player *p = ctx->player;
+                const quint64 g = ctx->gen;
+                ctx->post([p, g, stage] { p->onProgress(g, stage); });
+            }
+            break;
+        }
         case GST_MESSAGE_WARNING: {
             GError *err = nullptr;
             gst_message_parse_warning(msg, &err, nullptr);
@@ -240,7 +282,7 @@ struct PipelineCallbacks
         auto *ctx = static_cast<PipelineCtx *>(data);
         if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
             ctx->lastFrameUs.store(g_get_monotonic_time(), std::memory_order_relaxed);
-            if (ctx->frames.fetch_add(1, std::memory_order_relaxed) == 0) {
+            if (ctx->frames.fetch_add(1, std::memory_order_relaxed) == 0 && !ctx->pending) {
                 Player *p = ctx->player;
                 const quint64 g = ctx->gen;
                 ctx->post([p, g] { p->onFirstFrame(g); });
@@ -296,6 +338,19 @@ struct PipelineCallbacks
         return GST_PAD_PROBE_OK;
     }
 
+    // Frames reaching the video sink. A prepared stream becomes the shown
+    // one as soon as its first frame is on its (hidden) surface.
+    static GstPadProbeReturn shownProbe(GstPad *, GstPadProbeInfo *, gpointer data)
+    {
+        auto *ctx = static_cast<PipelineCtx *>(data);
+        if (ctx->shown.fetch_add(1, std::memory_order_relaxed) == 0 && ctx->pending) {
+            Player *p = ctx->player;
+            const quint64 g = ctx->gen;
+            ctx->post([p, g] { p->onFirstFrame(g); });
+        }
+        return GST_PAD_PROBE_OK;
+    }
+
     static GstPadProbeReturn countProbe(GstPad *, GstPadProbeInfo *, gpointer data)
     {
         static_cast<std::atomic<quint64> *>(data)->fetch_add(1, std::memory_order_relaxed);
@@ -311,7 +366,7 @@ struct PipelineCallbacks
         const QVideoFrame frame = sampleToFrame(sample);
         gst_sample_unref(sample);
         if (frame.isValid())
-            ctx->withPlayer([&](Player *p) { p->pushFrame(frame); });
+            ctx->withPlayer([&](Player *p) { p->pushFrame(frame, ctx->surface, ctx->gen); });
         return GST_FLOW_OK;
     }
 
@@ -585,6 +640,11 @@ Player::Player(QObject *parent)
     connect(&m_watchdog, &QTimer::timeout, this, &Player::onWatchdog);
     m_snapshotTimer.setSingleShot(true);
     connect(&m_snapshotTimer, &QTimer::timeout, this, &Player::requestSnapshot);
+    m_waitTimer.setSingleShot(true);
+    connect(&m_waitTimer, &QTimer::timeout, this, [this] {
+        m_waitExpired = true;
+        Q_EMIT overlayChanged();
+    });
 }
 
 Player::~Player()
@@ -851,9 +911,10 @@ void Player::applyConfig(const QVariantMap &c)
     setFlipH(c.value(QStringLiteral("flipH"), m_flipH).toBool());
     setFlipV(c.value(QStringLiteral("flipV"), m_flipV).toBool());
 
-    const bool streamChanged = url != m_url || user != m_username || pass != m_password
-                               || transport != m_transport || latency != m_latency
-                               || decoder != m_decoder || lowLatency != m_lowLatency;
+    const bool urlChanged = url != m_url;
+    const bool otherStreamChanged = user != m_username || pass != m_password
+                                    || transport != m_transport || latency != m_latency
+                                    || decoder != m_decoder || lowLatency != m_lowLatency;
     m_name = c.value(QStringLiteral("name"), m_name).toString().trimmed();
     if (m_name.isEmpty())
         m_name = QUrl(url).host().isEmpty() ? url : QUrl(url).host();
@@ -870,8 +931,17 @@ void Player::applyConfig(const QVariantMap &c)
     m_lowLatency = lowLatency;
     Q_EMIT configChanged();
     Q_EMIT persistentChanged();
-    if (streamChanged || outputChanged)
+    if (otherStreamChanged || outputChanged) {
+        m_streamUrl = m_url;
         restart();
+    } else if (urlChanged) {
+        // Only the address changed: open the new stream while the old one
+        // is still shown.
+        if (m_active)
+            switchStream(m_url, QStringLiteral("изменён адрес потока"));
+        else
+            m_streamUrl = m_url;
+    }
 }
 
 void Player::setActive(bool a)
@@ -894,6 +964,8 @@ void Player::stop()
     setActive(false);
     m_retryTimer.stop();
     teardown();
+    endWait();
+    m_lastError.clear();
     setStatus(Stopped);
 }
 
@@ -920,6 +992,7 @@ void Player::setSuspended(bool s, bool synchronous)
     if (s) {
         m_retryTimer.stop();
         teardown(synchronous);
+        endWait();
         if (m_active)
             setStatus(Suspended);
     } else {
@@ -929,7 +1002,7 @@ void Player::setSuspended(bool s, bool synchronous)
 
 bool Player::canRun() const
 {
-    return m_active && !m_suspended && m_sinkReady && !m_url.isEmpty();
+    return m_active && !m_suspended && m_surf[m_activeSurf].ready && !m_url.isEmpty();
 }
 
 void Player::ensureRunning()
@@ -978,7 +1051,68 @@ void Player::setStatus(Status s, const QString &text)
     m_status = s;
     m_statusText = t;
     Q_EMIT statusChanged();
+    Q_EMIT overlayChanged();
     updateHealth();
+}
+
+void Player::setStage(const QString &stage)
+{
+    m_stage = stage;
+    if (m_status == Connecting)
+        setStatus(Connecting, stage);
+    else if (m_status == Reconnecting)
+        setStatus(Reconnecting, m_lastError.isEmpty() ? stage : m_lastError + QLatin1Char('\n') + stage);
+}
+
+void Player::onProgress(quint64 gen, const QString &stage)
+{
+    if (isPending(gen)) {
+        m_pendingStage = stage;
+        Q_EMIT overlayChanged();
+    } else if (isActive(gen) && !m_gotFrame) {
+        setStage(stage);
+    }
+}
+
+bool Player::isActive(quint64 gen) const { return m_ctx && m_ctx->gen == gen; }
+bool Player::isPending(quint64 gen) const { return m_pending && m_pending->gen == gen; }
+
+void Player::beginWait()
+{
+    if (m_waitExpired || m_waitTimer.isActive())
+        return;
+    m_waitTimer.start(g_waitMs);
+}
+
+void Player::endWait()
+{
+    m_waitTimer.stop();
+    if (m_waitExpired) {
+        m_waitExpired = false;
+        Q_EMIT overlayChanged();
+    }
+}
+
+bool Player::overlayVisible() const
+{
+    switch (m_status) {
+    case Stopped:
+    case Suspended:
+        return true;
+    case Connecting:
+    case Reconnecting:
+        return m_waitExpired;
+    case Playing:
+        return m_pending && m_waitExpired;
+    }
+    return false;
+}
+
+QString Player::overlayText() const
+{
+    if (m_status == Playing)
+        return m_pending ? QStringLiteral("Переключение потока…\n") + m_pendingStage : QString();
+    return m_statusText;
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,11 +1176,12 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
         GstCaps *c = gst_caps_from_string("video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D");
         g_object_set(rgba, "caps", c, nullptr);
         gst_caps_unref(c);
-        g_object_set(sink, "widget", static_cast<gpointer>(m_glItem.data()), nullptr);
+        g_object_set(sink, "widget", static_cast<gpointer>(m_surf[ctx->surface].glItem.data()), nullptr);
+        ctx->sink = sink;
         gsu::setArg(sink, "sync", sync);
         gsu::setArg(sink, "enable-last-sample", QStringLiteral("false"));
         if (GstPad *sp = gst_element_get_static_pad(sink, "sink")) {
-            gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->shown, nullptr);
+            gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::shownProbe, ctx, nullptr);
             gst_object_unref(sp);
         }
         if (GstPad *cp = gst_element_get_static_pad(conv, "sink")) {
@@ -1076,6 +1211,7 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
         std::memset(&cb, 0, sizeof(cb));
         cb.new_sample = &PipelineCallbacks::newSample;
         gst_app_sink_set_callbacks(GST_APP_SINK(sink), &cb, ctx, nullptr);
+        ctx->sink = sink;
         elems << conv << sink;
     }
     for (GstElement *e : elems)
@@ -1100,32 +1236,80 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
 void Player::startPipeline()
 {
     m_startPending = false;
-    ++m_gen;
+    m_codec.clear();
+    m_decoderName.clear();
+    m_hwDecoding = false;
+    Q_EMIT videoInfoChanged();
+    if (m_streamUrl.isEmpty())
+        m_streamUrl = m_url;
+
+    QString err;
+    PipelineCtx *ctx = buildPipeline(m_streamUrl, false, &err);
+    if (!ctx) {
+        scheduleRetry(err);
+        return;
+    }
+    Source kind = Source::Other;
+    m_sourceUrl = resolveUrl(m_streamUrl, &kind);
+    m_pipeline = ctx->pipeline;
+    m_ctx = ctx;
+    m_gotFrame = false;
+    m_lastFrames = 0;
+    m_stallTicks = 0;
+    m_connectTicks = 0;
+    m_stallLimit = ctx->stallLimit;
+    m_stage = QStringLiteral("Подключение к %1…").arg(ctx->host);
+    if (m_status == Reconnecting)
+        setStage(m_stage);
+    else
+        setStatus(Connecting, m_stage);
+    beginWait();
+    m_watchdog.start();
+
+    if (gst_element_set_state(ctx->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        scheduleRetry(QStringLiteral("Не удалось запустить воспроизведение"));
+        return;
+    }
+    if (kind == Source::Snapshot)
+        requestSnapshot();
+    else if (kind == Source::MseLd)
+        startMseLd(m_sourceUrl);
+}
+
+PipelineCtx *Player::buildPipeline(const QString &urlText, bool pending, QString *error)
+{
     auto *ctx = new PipelineCtx;
     ctx->player = this;
-    ctx->gen = m_gen;
+    ctx->gen = ++m_gen;
     ctx->name = m_name;
-    ctx->glSink = g_glRendering && m_glItem;
+    ctx->url = urlText;
+    ctx->pending = pending;
+    // A prepared stream draws on the hidden surface of the tile.
+    ctx->surface = pending ? 1 - m_activeSurf : m_activeSurf;
+    ctx->glSink = g_glRendering && m_surf[ctx->surface].glItem;
     ctx->convert = m_needConvert || copyMode()
                    || qEnvironmentVariableIntValue("HMI_GL_COPY") > 0;
     ctx->debug = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     ctx->pref = (m_decoder == DecoderAuto && (m_hwFailed || m_hwSlow || m_balancedSw)) ? gsu::DecoderPref::Software
                                                          : gsu::DecoderPref(m_decoder);
-    m_codec.clear();
-    m_decoderName.clear();
-    m_hwDecoding = false;
-    Q_EMIT videoInfoChanged();
+    ctx->username = m_username;
+    ctx->password = m_password;
 
     GstElement *pipe = gst_pipeline_new(nullptr);
     ctx->pipeline = pipe;
-    auto abort = [&](const QString &msg) {
+    auto abort = [&](const QString &msg) -> PipelineCtx * {
         gst_object_unref(pipe);
         delete ctx;
-        scheduleRetry(msg);
+        *error = msg;
+        return nullptr;
     };
 
     Source kind = Source::Other;
-    const QUrl url = resolveUrl(m_url, &kind);
+    const QUrl url = resolveUrl(urlText, &kind);
+    ctx->host = url.host().isEmpty() ? url.toString(QUrl::RemoveUserInfo)
+                                     : url.host() + (url.port() > 0 ? QStringLiteral(":%1").arg(url.port()) : QString());
+    if (pending && (kind == Source::Snapshot || kind == Source::MseLd))
+        return abort(QStringLiteral("Источник не поддерживает подготовку потока"));
     if (kind == Source::HttpStream) {
         const QString path = url.path().toLower();
         ctx->adaptive = path.endsWith(QLatin1String(".m3u8")) || path.endsWith(QLatin1String(".mpd"))
@@ -1142,11 +1326,6 @@ void Player::startPipeline()
         return abort(err);
     gst_bin_add(GST_BIN(pipe), tail);
     ctx->tail = tail;
-
-    m_sourceUrl = url;
-    m_stallLimit = 10;
-    ctx->username = m_username;
-    ctx->password = m_password;
 
     switch (kind) {
     case Source::Rtsp: {
@@ -1200,7 +1379,7 @@ void Player::startPipeline()
             g_signal_connect(parse, "pad-added", G_CALLBACK(&PipelineCallbacks::parsedPadAdded), ctx);
         }
         if (ctx->adaptive)
-            m_stallLimit = 20;     // segments arrive in bursts
+            ctx->stallLimit = 20;     // segments arrive in bursts
         break;
     }
     case Source::Snapshot: {
@@ -1218,7 +1397,7 @@ void Player::startPipeline()
             m_appsrc = nullptr;
             return abort(QStringLiteral("Не найден декодер JPEG"));
         }
-        m_stallLimit = qMax(10, 2 * m_snapshotInterval / 1000 + 5);
+        ctx->stallLimit = qMax(10, 2 * m_snapshotInterval / 1000 + 5);
         break;
     }
     case Source::MseLd: {
@@ -1263,9 +1442,11 @@ void Player::startPipeline()
         gst_bin_add_many(GST_BIN(pipe), src, caps, nullptr);
         gst_element_link_many(src, caps, tail, nullptr);
         ctx->linked = true;
-        m_codec = QStringLiteral("RAW");
-        m_decoderName = QStringLiteral("videotestsrc");
-        Q_EMIT videoInfoChanged();
+        ctx->codec = QStringLiteral("RAW");
+        ctx->decoder = QStringLiteral("videotestsrc");
+        ctx->hasDecoder = true;
+        if (!pending)
+            applyDecoderInfo(ctx->codec, ctx->decoder, false);
         break;
     }
     case Source::Other: {
@@ -1283,25 +1464,136 @@ void Player::startPipeline()
     GstBus *bus = gst_element_get_bus(pipe);
     gst_bus_set_sync_handler(bus, &PipelineCallbacks::busSync, ctx, nullptr);
     gst_object_unref(bus);
+    return ctx;
+}
 
-    m_pipeline = pipe;
-    m_ctx = ctx;
-    m_gotFrame = false;
-    m_lastFrames = 0;
-    m_stallTicks = 0;
-    m_connectTicks = 0;
-    setStatus(m_status == Reconnecting ? Reconnecting : Connecting,
-              m_status == Reconnecting ? m_statusText : QString());
-    m_watchdog.start();
-
-    if (gst_element_set_state(pipe, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        scheduleRetry(QStringLiteral("Не удалось запустить воспроизведение"));
+// ---------------------------------------------------------------------------
+// Seamless stream switching
+// ---------------------------------------------------------------------------
+void Player::switchStream(const QString &url, const QString &reason)
+{
+    const QString target = url.trimmed().isEmpty() ? m_url : url.trimmed();
+    if (m_pending) {
+        if (m_pending->url == target)
+            return;                               // already being prepared
+        releasePipeline(m_pending, false);        // only the last request counts
+        m_pending = nullptr;
+    }
+    if (target == m_streamUrl && m_ctx) {
+        Q_EMIT overlayChanged();
         return;
     }
-    if (kind == Source::Snapshot)
-        requestSnapshot();
-    else if (kind == Source::MseLd)
-        startMseLd(url);
+    Source kind = Source::Other;
+    resolveUrl(target, &kind);
+    Source curKind = Source::Other;
+    resolveUrl(m_streamUrl, &curKind);
+    const bool shown = m_ctx && m_status == Playing && m_gotFrame;
+    const Surface &spare = m_surf[1 - m_activeSurf];
+    const bool sameKind = bool(spare.glItem) == bool(m_surf[m_activeSurf].glItem);
+    const bool seamless = shown && canRun() && spare.ready && sameKind && kind != Source::Snapshot && kind != Source::MseLd
+                          && curKind != Source::Snapshot && curKind != Source::MseLd;
+    if (!seamless) {
+        // Nothing live on the screen: switch directly (the last frame stays).
+        m_streamUrl = target;
+        Q_EMIT streamUrlChanged();
+        m_retry = 0;
+        m_retryTimer.stop();
+        teardown();
+        ensureRunning();
+        return;
+    }
+    QString err;
+    PipelineCtx *ctx = buildPipeline(target, true, &err);
+    if (!ctx) {
+        Q_EMIT switchFailed(target, err);
+        return;
+    }
+    m_pending = ctx;
+    m_pendingTicks = 0;
+    m_pendingReason = reason;
+    m_pendingStage = QStringLiteral("Подключение к %1…").arg(ctx->host);
+    if (!reason.isEmpty())
+        qInfo("[%s] switching to %s: %s", qPrintable(m_name), qPrintable(target), qPrintable(reason));
+    beginWait();
+    Q_EMIT overlayChanged();
+    if (gst_element_set_state(ctx->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+        failPending(QStringLiteral("Не удалось запустить воспроизведение"));
+}
+
+// The prepared stream delivered its first frame (or the shown one failed):
+// it becomes the active one; the old pipeline stops drawing first, then the
+// new output is released, so the surface always shows a picture.
+void Player::activatePending()
+{
+    PipelineCtx *ctx = m_pending;
+    if (!ctx)
+        return;
+    m_pending = nullptr;
+    const bool ready = ctx->frames.load(std::memory_order_relaxed) > 0;
+    PipelineCtx *old = m_ctx;
+    if (old) {
+        stopNetworkSources();
+        m_ctx = nullptr;
+        m_pipeline = nullptr;
+    }
+    m_ctx = ctx;
+    m_pipeline = ctx->pipeline;
+    m_streamUrl = ctx->url;
+    if (m_activeSurf != ctx->surface) {
+        m_activeSurf = ctx->surface;     // the tile shows the other surface now
+        Q_EMIT surfaceIndexChanged();
+    }
+    m_sourceUrl = resolveUrl(ctx->url, nullptr);
+    m_stallLimit = ctx->stallLimit;
+    resetStats();
+    m_lastFrames = ctx->frames.load(std::memory_order_relaxed);
+    m_lastIn = ctx->hasDecoderProbe ? ctx->inFrames.load(std::memory_order_relaxed) : m_lastFrames;
+    m_lastBytes = ctx->inBytes.load(std::memory_order_relaxed);
+    m_stallTicks = 0;
+    m_connectTicks = 0;
+    m_gotFrame = ready;
+    if (ctx->hasDecoder)
+        applyDecoderInfo(ctx->codec, ctx->decoder, ctx->hw);
+    else {
+        m_codec.clear();
+        m_decoderName.clear();
+        m_hwDecoding = false;
+        Q_EMIT videoInfoChanged();
+    }
+    if (ctx->hasSize)
+        applyVideoSize(ctx->w, ctx->h, ctx->parN, ctx->parD, ctx->fpsN, ctx->fpsD);
+    Q_EMIT streamUrlChanged();
+    if (ready) {
+        m_retry = 0;
+        m_lastError.clear();
+        endWait();
+        setStatus(Playing, QString());
+        qInfo("[%s] now playing %s", qPrintable(m_name), qPrintable(ctx->url));
+        Q_EMIT switchDone(ctx->url);
+    } else {
+        m_stage = m_pendingStage;
+        setStatus(m_status == Reconnecting ? Reconnecting : Connecting, m_stage);
+        beginWait();
+    }
+    m_watchdog.start();
+    Q_EMIT overlayChanged();
+
+    if (old)
+        releasePipeline(old, false);
+}
+
+void Player::failPending(const QString &reason)
+{
+    if (!m_pending)
+        return;
+    const QString url = m_pending->url;
+    releasePipeline(m_pending, false);
+    m_pending = nullptr;
+    qInfo("[%s] switch to %s failed: %s", qPrintable(m_name), qPrintable(url), qPrintable(reason));
+    if (m_status == Playing)
+        endWait();
+    Q_EMIT overlayChanged();
+    Q_EMIT switchFailed(url, reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,10 +1736,10 @@ void Player::requestSnapshot()
     addBasicAuth(req, m_username, m_password);
     QNetworkReply *reply = m_nam->get(req);
     m_snapReply = reply;
-    const quint64 gen = m_gen;
+    const quint64 gen = m_ctx ? m_ctx->gen : 0;
     connect(reply, &QNetworkReply::finished, this, [this, reply, gen] {
         reply->deleteLater();
-        if (gen != m_gen || !m_pipeline)
+        if (!isActive(gen))
             return;
         m_snapReply = nullptr;
         if (reply->error() != QNetworkReply::NoError) {
@@ -1463,11 +1755,11 @@ void Player::startMseLd(const QUrl &url)
 {
 #ifdef HMI_HAVE_WEBSOCKETS
     m_ws = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
-    const quint64 gen = m_gen;
+    const quint64 gen = m_ctx ? m_ctx->gen : 0;
     connect(m_ws, &QWebSocket::textMessageReceived, this, [this, gen](const QString &m) { onMseText(gen, m); });
     connect(m_ws, &QWebSocket::binaryMessageReceived, this, [this, gen](const QByteArray &d) { onMseBinary(gen, d); });
     connect(m_ws, &QWebSocket::disconnected, this, [this, gen] {
-        if (gen == m_gen && m_pipeline)
+        if (isActive(gen))
             scheduleRetry(QStringLiteral("WebSocket закрыт") + (m_ws && !m_ws->closeReason().isEmpty()
                                                                    ? QStringLiteral(": ") + m_ws->closeReason()
                                                                    : QString()));
@@ -1477,7 +1769,7 @@ void Player::startMseLd(const QUrl &url)
 #else
     connect(m_ws, qOverload<QAbstractSocket::SocketError>(&QWebSocket::error), this, [this, gen](QAbstractSocket::SocketError) {
 #endif
-        if (gen == m_gen && m_pipeline)
+        if (isActive(gen))
             scheduleRetry(m_ws ? m_ws->errorString() : QStringLiteral("Ошибка WebSocket"));
     });
     QNetworkRequest req(url);
@@ -1491,7 +1783,7 @@ void Player::startMseLd(const QUrl &url)
 void Player::onMseText(quint64 gen, const QString &msg)
 {
 #ifdef HMI_HAVE_WEBSOCKETS
-    if (gen != m_gen || !m_pipeline)
+    if (!isActive(gen))
         return;
     const QJsonObject o = QJsonDocument::fromJson(msg.toUtf8()).object();
     if (o.value(QLatin1String("type")).toString() != QLatin1String("mse_init_segment"))
@@ -1526,17 +1818,15 @@ void Player::onMseText(quint64 gen, const QString &msg)
 
 void Player::onMseBinary(quint64 gen, const QByteArray &data)
 {
-    if (gen != m_gen || !m_pipeline || !m_mseInit)
+    if (!isActive(gen) || !m_mseInit)
         return;
     // Media fragment (moof+mdat) of one track; byte 47 = tfhd track_id.
     if (data.size() > 47 && int(uchar(data.at(47))) == m_mseTrack)
         pushToAppSrc(data);
 }
 
-void Player::teardown(bool synchronous)
+void Player::resetStats()
 {
-    m_watchdog.stop();
-    stopNetworkSources();
     m_fps = m_inFps = m_shownFps = m_frameAge = 0;
     m_lastIn = m_lastShown = m_lastUploaded = m_lastBytes = 0;
     m_bitrate = 0;
@@ -1544,23 +1834,70 @@ void Player::teardown(bool synchronous)
     m_slowOutTicks = 0;
     m_statsUs = 0;
     m_qtShown = 0;
+}
+
+void Player::teardown(bool synchronous)
+{
+    m_watchdog.stop();
+    stopNetworkSources();
+    resetStats();
     Q_EMIT statsChanged();
-    if (!m_pipeline)
-        return;
-    ++m_gen;   // events already queued by the old pipeline become stale
-    PipelineCtx *ctx = m_ctx;
-    GstElement *pipe = m_pipeline;
-    m_ctx = nullptr;
-    m_pipeline = nullptr;
-    ctx->kill();
     {
         QMutexLocker l(&m_frameMutex);
-        m_latestFrame = QVideoFrame();
+        m_latestFrame[0] = m_latestFrame[1] = QVideoFrame();
     }
+    if (m_pending) {
+        releasePipeline(m_pending, synchronous);
+        m_pending = nullptr;
+        Q_EMIT overlayChanged();
+    }
+    if (!m_ctx)
+        return;
+    PipelineCtx *ctx = m_ctx;
+    m_ctx = nullptr;
+    m_pipeline = nullptr;
+    releasePipeline(ctx, synchronous);
+}
+
+namespace {
+// Detaches qml6glsink from its QML item before the pipeline stops: the sink
+// clears the item when it goes to READY (black tile), a detached sink leaves
+// the last frame on the screen until the next stream draws.
+void detachSurface(PipelineCtx *ctx)
+{
+    if (!ctx->glSink || !ctx->sink)
+        return;
+    GstPad *pad = gst_element_get_static_pad(ctx->sink, "sink");
+    if (!pad)
+        return;
+    // The streaming thread must not be inside the sink while the item
+    // pointer is replaced: take the stream lock of its input (it is released
+    // between frames; a frame waiting for the clock takes < 1 frame period).
+    GRecMutex *lock = GST_PAD_GET_STREAM_LOCK(pad);
+    bool locked = false;
+    for (int i = 0; i < 100 && !(locked = g_rec_mutex_trylock(lock)); ++i)
+        g_usleep(5000);
+    if (locked) {
+        g_object_set(ctx->sink, "widget", nullptr, nullptr);
+        g_rec_mutex_unlock(lock);
+    }
+    gst_object_unref(pad);
+}
+} // namespace
+
+void Player::releasePipeline(PipelineCtx *ctx, bool synchronous, std::function<void()> after)
+{
+    if (!ctx)
+        return;
+    ctx->kill();
+    GstElement *pipe = ctx->pipeline;
     ++m_teardowns;
     QPointer<Player> self(this);
     // Stopping rtspsrc may block on network I/O, so it is done off the GUI thread.
-    auto job = [pipe, ctx, self]() {
+    auto job = [pipe, ctx, self, after]() {
+        detachSurface(ctx);
+        if (after)
+            after();
         gst_element_set_state(pipe, GST_STATE_NULL);
         GstBus *bus = gst_element_get_bus(pipe);
         gst_bus_set_sync_handler(bus, nullptr, nullptr, nullptr);
@@ -1600,19 +1937,46 @@ void Player::scheduleRetry(const QString &reason)
     } else {
         ++m_retry;
     }
+    m_lastError = text;
+    if (m_pending && m_active && !m_suspended) {
+        // The shown stream failed while another one is being prepared: the
+        // prepared one takes over at once.
+        qInfo("[%s] %s: using the prepared stream", qPrintable(m_name), qPrintable(text));
+        if (m_status == Playing)
+            m_status = Reconnecting;
+        activatePending();
+        return;
+    }
     teardown();
     if (!m_active || m_suspended) {
         ensureRunning();
         return;
     }
     setStatus(Reconnecting, QStringLiteral("%1\nПовтор через %2 с").arg(text).arg(qMax(1, delay / 1000)));
+    beginWait();
     m_retryTimer.start(delay);
 }
 
 void Player::onWatchdog()
 {
+    if (m_pending) {
+        ++m_pendingTicks;
+        const quint64 bytes = m_pending->inBytes.load(std::memory_order_relaxed);
+        if (m_pending->frames.load(std::memory_order_relaxed) == 0 && bytes > 0) {
+            m_pendingStage = QStringLiteral("%1: получено %2 КБ, ожидание ключевого кадра…")
+                                 .arg(m_pending->host).arg(bytes / 1024);
+            Q_EMIT overlayChanged();
+        }
+        if (m_pendingTicks >= qMax(25, m_pending->stallLimit))
+            failPending(QStringLiteral("Таймаут подключения"));
+    }
     if (!m_ctx)
         return;
+    if (!m_gotFrame) {
+        const quint64 bytes = m_ctx->inBytes.load(std::memory_order_relaxed);
+        if (bytes > 0)
+            setStage(QStringLiteral("%1: получено %2 КБ, ожидание ключевого кадра…").arg(m_ctx->host).arg(bytes / 1024));
+    }
     // Rates use the real elapsed time: the GUI thread may be late when the
     // system is overloaded, a fixed 1 s period would overstate the rates.
     const qint64 nowUs = g_get_monotonic_time();
@@ -1868,15 +2232,34 @@ static QString explainError(const QString &msg)
 
 void Player::onPipelineError(quint64 gen, const QString &msg)
 {
-    if (gen != m_gen || !m_pipeline)
-        return;
-    scheduleRetry(explainError(msg));
+    if (isPending(gen))
+        failPending(explainError(msg));
+    else if (isActive(gen))
+        scheduleRetry(explainError(msg));
 }
 
 void Player::onDecoderSelected(quint64 gen, const QString &codec, const QString &decoder, bool hw)
 {
-    if (gen != m_gen)
+    PipelineCtx *ctx = isPending(gen) ? m_pending : isActive(gen) ? m_ctx : nullptr;
+    if (!ctx)
         return;
+    ctx->codec = codec;
+    ctx->decoder = decoder;
+    ctx->hw = hw;
+    ctx->hasDecoder = true;
+    const QString stage = QStringLiteral("%1: поток %2 получен, ожидание ключевого кадра…").arg(ctx->host, codec);
+    if (ctx == m_pending) {
+        m_pendingStage = stage;
+        Q_EMIT overlayChanged();
+        return;
+    }
+    applyDecoderInfo(codec, decoder, hw);
+    if (!m_gotFrame)
+        setStage(stage);
+}
+
+void Player::applyDecoderInfo(const QString &codec, const QString &decoder, bool hw)
+{
     m_codec = codec;
     m_decoderName = decoder;
     m_hwDecoding = hw;
@@ -1885,8 +2268,23 @@ void Player::onDecoderSelected(quint64 gen, const QString &codec, const QString 
 
 void Player::onVideoSize(quint64 gen, int w, int h, int parN, int parD, int fpsN, int fpsD)
 {
-    if (gen != m_gen || w <= 0 || h <= 0)
+    if (w <= 0 || h <= 0)
         return;
+    if (isPending(gen)) {
+        m_pending->w = w;
+        m_pending->h = h;
+        m_pending->parN = parN;
+        m_pending->parD = parD;
+        m_pending->fpsN = fpsN;
+        m_pending->fpsD = fpsD;
+        m_pending->hasSize = true;
+    } else if (isActive(gen)) {
+        applyVideoSize(w, h, parN, parD, fpsN, fpsD);
+    }
+}
+
+void Player::applyVideoSize(int w, int h, int parN, int parD, int fpsN, int fpsD)
+{
     m_nominalFps = (fpsN > 0 && fpsD > 0) ? qreal(fpsN) / fpsD : 0;
     if (parN > 0 && parD > 0 && parN != parD)
         w = int(qint64(w) * parN / parD);
@@ -1905,48 +2303,63 @@ void Player::onVideoSize(quint64 gen, int w, int h, int parN, int parD, int fpsN
 
 void Player::onFirstFrame(quint64 gen)
 {
-    if (gen != m_gen)
+    if (isPending(gen)) {
+        activatePending();
+        return;
+    }
+    if (!isActive(gen))
         return;
     m_gotFrame = true;
     m_retry = 0;
+    m_lastError.clear();
+    endWait();
     setStatus(Playing, QString());
 }
 
 // ---------------------------------------------------------------------------
 // Surfaces
 // ---------------------------------------------------------------------------
-void Player::clearSurface()
+void Player::clearSurface(int index)
 {
-    if (m_surfaceConn)
-        disconnect(m_surfaceConn);
+    Surface &sf = m_surf[index];
+    if (sf.conn)
+        disconnect(sf.conn);
     // qml6glsink must be stopped before its QML item is destroyed.
-    teardown(bool(m_glItem));
-    m_surface = nullptr;
-    m_glItem = nullptr;
-    m_videoSink = nullptr;
-    m_sinkReady = false;
+    const bool sync = bool(m_surf[0].glItem) || bool(m_surf[1].glItem);
+    if ((m_ctx && m_ctx->surface == index) || (m_pending && m_pending->surface == index))
+        teardown(sync);
+    sf.obj = nullptr;
+    sf.glItem = nullptr;
+    sf.videoSink = nullptr;
+    sf.ready = false;
+    {
+        QMutexLocker l(&m_frameMutex);
+        m_latestFrame[index] = QVideoFrame();
+    }
 }
 
-void Player::attachGlItem(QQuickItem *item)
+void Player::attachGlItem(QQuickItem *item, int index)
 {
-    if (!item || m_surface == item)
+    index = index ? 1 : 0;
+    if (!item || m_surf[index].obj == item)
         return;
-    clearSurface();
-    m_surface = item;
-    m_glItem = item;
-    m_surfaceConn = connect(item, &QObject::destroyed, this, [this] { clearSurface(); ensureRunning(); });
-    scheduleGlReady();
+    clearSurface(index);
+    Surface &sf = m_surf[index];
+    sf.obj = item;
+    sf.glItem = item;
+    sf.conn = connect(item, &QObject::destroyed, this, [this, index] { clearSurface(index); ensureRunning(); });
+    scheduleGlReady(index);
     ensureRunning();
 }
 
-void Player::scheduleGlReady()
+void Player::scheduleGlReady(int index)
 {
-    QQuickItem *item = m_glItem;
+    QQuickItem *item = m_surf[index].glItem;
     if (!item)
         return;
     QQuickWindow *w = item->window();
     if (!w) {
-        connect(item, &QQuickItem::windowChanged, this, [this] { scheduleGlReady(); },
+        connect(item, &QQuickItem::windowChanged, this, [this, index] { scheduleGlReady(index); },
                 Qt::SingleShotConnection);
         return;
     }
@@ -1954,10 +2367,10 @@ void Player::scheduleGlReady()
     // the window's scene graph was initialised. A render job runs exactly then.
     QPointer<Player> self(this);
     QPointer<QQuickItem> it(item);
-    w->scheduleRenderJob(new FnJob([self, it] {
-                             QMetaObject::invokeMethod(qApp, [self, it] {
-                                 if (self && it && self->m_glItem == it) {
-                                     self->m_sinkReady = true;
+    w->scheduleRenderJob(new FnJob([self, it, index] {
+                             QMetaObject::invokeMethod(qApp, [self, it, index] {
+                                 if (self && it && self->m_surf[index].glItem == it) {
+                                     self->m_surf[index].ready = true;
                                      self->ensureRunning();
                                  }
                              }, Qt::QueuedConnection);
@@ -1966,48 +2379,65 @@ void Player::scheduleGlReady()
     w->update();
 }
 
-void Player::attachVideoSink(QVideoSink *sink)
+void Player::attachVideoSink(QVideoSink *sink, int index)
 {
-    if (!sink || m_surface == sink)
+    index = index ? 1 : 0;
+    if (!sink || m_surf[index].obj == sink)
         return;
-    clearSurface();
-    m_surface = sink;
-    m_videoSink = sink;
-    m_surfaceConn = connect(sink, &QObject::destroyed, this, [this] { clearSurface(); ensureRunning(); });
-    m_sinkReady = true;
+    clearSurface(index);
+    Surface &sf = m_surf[index];
+    sf.obj = sink;
+    sf.videoSink = sink;
+    sf.conn = connect(sink, &QObject::destroyed, this, [this, index] { clearSurface(index); ensureRunning(); });
+    sf.ready = true;
     ensureRunning();
 }
 
 void Player::detachSink(QObject *surface)
 {
-    if (surface && m_surface == surface) {
-        clearSurface();
-        ensureRunning();
+    for (int i = 0; i < 2; ++i) {
+        if (surface && m_surf[i].obj == surface) {
+            clearSurface(i);
+            ensureRunning();
+        }
     }
 }
 
-void Player::pushFrame(const QVideoFrame &frame)
+void Player::pushFrame(const QVideoFrame &frame, int surface, quint64 gen)
 {
     QMutexLocker l(&m_frameMutex);
-    m_latestFrame = frame;
-    if (m_framePosted)
+    m_latestFrame[surface] = frame;
+    m_frameGen[surface] = gen;
+    if (m_framePosted[surface])
         return;        // GUI thread has not consumed the previous frame: replace it
-    m_framePosted = true;
+    m_framePosted[surface] = true;
     l.unlock();
-    QMetaObject::invokeMethod(this, [this] { flushFrame(); }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(this, [this, surface] { flushFrame(surface); }, Qt::QueuedConnection);
 }
 
-void Player::flushFrame()
+void Player::flushFrame(int surface)
 {
     QVideoFrame f;
+    quint64 gen = 0;
     {
         QMutexLocker l(&m_frameMutex);
-        f = m_latestFrame;
-        m_latestFrame = QVideoFrame();
-        m_framePosted = false;
+        f = m_latestFrame[surface];
+        gen = m_frameGen[surface];
+        m_latestFrame[surface] = QVideoFrame();
+        m_framePosted[surface] = false;
     }
-    if (m_videoSink && f.isValid()) {
-        m_videoSink->setVideoFrame(f);
+    QVideoSink *sink = m_surf[surface].videoSink;
+    if (!sink || !f.isValid())
+        return;
+    const bool active = isActive(gen);
+    if (!active && !isPending(gen))
+        return;        // stale frame of a stopped pipeline
+    sink->setVideoFrame(f);
+    if (active) {
         m_qtShown.fetch_add(1, std::memory_order_relaxed);
+        if (!m_gotFrame)
+            onFirstFrame(gen);
+    } else {
+        onFirstFrame(gen);   // prepared stream is on its surface: show it
     }
 }

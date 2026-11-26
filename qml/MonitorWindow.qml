@@ -361,6 +361,7 @@ ApplicationWindow {
         MenuItem { text: "Запустить все плееры"; onTriggered: root.win.startAll() }
         MenuItem { text: "Остановить все плееры"; onTriggered: root.win.stopAll() }
         MenuSeparator {}
+        MenuItem { text: "Настройки программы…"; onTriggered: settingsDialog.open() }
         MenuItem { text: "Диагностика…"; onTriggered: App.openDiagnostics() }
         MenuItem { text: "О программе…"; onTriggered: aboutDialog.open() }
         MenuItem { text: "Выход\tCtrl+Q"; onTriggered: App.quit() }
@@ -529,6 +530,7 @@ ApplicationWindow {
     // ------------------------------------------------------------------ dialogs
     PlayerDialog { id: playerDialog; win: root.win }
     WindowDialog { id: windowDialog; win: root.win }
+    SettingsDialog { id: settingsDialog }
 
     ConfirmDialog {
         id: deleteDialog

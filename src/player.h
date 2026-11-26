@@ -18,6 +18,7 @@
 #include <gst/gst.h>
 
 #include <atomic>
+#include <functional>
 
 class QQuickItem;
 class QVideoSink;
@@ -81,6 +82,18 @@ class Player : public QObject
     // 0 auto (learned), 1 GL zero-copy, 2 GL with copy, 3 Qt Multimedia
     Q_PROPERTY(int output READ output NOTIFY renderPathChanged)
     Q_PROPERTY(QString renderPath READ renderPath NOTIFY renderPathChanged)
+    // Status panel over the video: shown when the video is stopped, or when
+    // no new frame came within the "waiting for the stream" time (until then
+    // the last frame stays on the screen).
+    Q_PROPERTY(bool overlayVisible READ overlayVisible NOTIFY overlayChanged)
+    Q_PROPERTY(QString overlayText READ overlayText NOTIFY overlayChanged)
+    // A new stream is being prepared while the current one is still shown.
+    Q_PROPERTY(bool switching READ switching NOTIFY overlayChanged)
+    // Address of the stream actually played (may differ from url: profiles).
+    Q_PROPERTY(QString streamUrl READ streamUrl NOTIFY streamUrlChanged)
+    // Each tile has two video surfaces: the shown one and the one a new
+    // stream is prepared on. Index of the shown surface.
+    Q_PROPERTY(int surfaceIndex READ surfaceIndex NOTIFY surfaceIndexChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -100,6 +113,10 @@ public:
     // Render path chosen once at startup (true: qml6glsink, false: QVideoSink).
     static void setGlRendering(bool on);
     static bool glRendering();
+    // "Waiting for the video stream" (application setting): how long the last
+    // frame is kept on the screen before the exchange status is shown.
+    static void setWaitTimeout(int ms);
+    static int waitTimeout();
     ~Player() override;
 
     static Player *fromJson(const QJsonObject &o, QObject *parent);
@@ -201,16 +218,26 @@ public:
     Q_INVOKABLE void restart();
     Q_INVOKABLE void resetSize();   // original (native) video size
 
+    // Seamless change of the played stream: the new stream is opened while
+    // the current one keeps playing; the picture switches on its first frame.
+    // Falls back to a plain restart (last frame kept) when nothing is shown.
+    Q_INVOKABLE void switchStream(const QString &url, const QString &reason = QString());
+    QString streamUrl() const { return m_streamUrl; }
+    bool overlayVisible() const;
+    QString overlayText() const;
+    bool switching() const { return m_pending != nullptr; }
+
     // Video surface handling (called from QML).
-    Q_INVOKABLE void attachGlItem(QQuickItem *item);
-    Q_INVOKABLE void attachVideoSink(QVideoSink *sink);
+    Q_INVOKABLE void attachGlItem(QQuickItem *item, int index = 0);
+    Q_INVOKABLE void attachVideoSink(QVideoSink *sink, int index = 0);
+    int surfaceIndex() const { return m_activeSurf; }
     Q_INVOKABLE void detachSink(QObject *surface);
 
     // Window minimised / closed: release the decoder but keep "active".
     void setSuspended(bool s, bool synchronous = false);
 
     // Called from GStreamer streaming threads (via PipelineCtx).
-    void pushFrame(const QVideoFrame &frame);
+    void pushFrame(const QVideoFrame &frame, int surface, quint64 gen);
 
 Q_SIGNALS:
     void configChanged();
@@ -225,6 +252,12 @@ Q_SIGNALS:
     void videoInfoChanged();
     void statsChanged();
     void persistentChanged();   // something that must be saved changed
+    void overlayChanged();
+    void streamUrlChanged();
+    void surfaceIndexChanged();
+    // The prepared stream could not be opened; the current one is kept.
+    void switchFailed(const QString &url, const QString &reason);
+    void switchDone(const QString &url);
 
 private:
     friend struct PipelineCtx;
@@ -233,15 +266,31 @@ private:
     bool canRun() const;
     void ensureRunning();
     void startPipeline();
+    // Builds a pipeline for the URL; pending: output blocked until activation.
+    PipelineCtx *buildPipeline(const QString &url, bool pending, QString *error);
     void teardown(bool synchronous = false);
+    // Stops one pipeline; the GL surface keeps its last frame. 'after' runs
+    // (in the worker) once the pipeline no longer draws on the surface.
+    void releasePipeline(PipelineCtx *ctx, bool synchronous, std::function<void()> after = {});
+    void activatePending();
+    void failPending(const QString &reason);
+    void beginWait();
+    void endWait();
+    void setStage(const QString &stage);
+    void onProgress(quint64 gen, const QString &stage);
+    bool isActive(quint64 gen) const;
+    bool isPending(quint64 gen) const;
+    void applyDecoderInfo(const QString &codec, const QString &decoder, bool hw);
+    void applyVideoSize(int w, int h, int parN, int parD, int fpsN, int fpsD);
+    void resetStats();
     void setStatus(Status s, const QString &text = QString());
     void setActive(bool a);
-    void scheduleGlReady();
+    void scheduleGlReady(int index);
     void scheduleRetry(const QString &reason);
     void onTeardownDone();
     void onWatchdog();
-    void flushFrame();
-    void clearSurface();
+    void flushFrame(int surface);
+    void clearSurface(int index);
 
     // Events delivered from streaming threads (queued to the GUI thread).
     void onPipelineError(quint64 gen, const QString &msg);
@@ -325,6 +374,13 @@ private:
     int m_slowOutTicks = 0;
     QString m_fallbackNote;
     int m_retry = 0;
+    QString m_lastError;        // shown while reconnecting
+    QString m_stage;            // exchange status of the connecting stream
+    QString m_pendingStage;     // ... of the prepared stream
+    QString m_pendingReason;
+    int m_pendingTicks = 0;
+    bool m_waitExpired = false;
+    QTimer m_waitTimer;
     int m_stallTicks = 0;
     int m_connectTicks = 0;
     quint64 m_lastFrames = 0;
@@ -332,8 +388,10 @@ private:
 
     // pipeline
     GstElement *m_pipeline = nullptr;
-    PipelineCtx *m_ctx = nullptr;
-    quint64 m_gen = 0;
+    PipelineCtx *m_ctx = nullptr;          // active (shown) pipeline
+    PipelineCtx *m_pending = nullptr;      // prepared, output blocked
+    QString m_streamUrl;                   // URL of the active pipeline
+    quint64 m_gen = 0;                     // last generation handed out
     int m_teardowns = 0;         // asynchronous teardowns still running
     int m_stallLimit = 10;       // seconds without frames before reconnect
     GstElement *m_appsrc = nullptr;   // snapshot / MSE-LD input (owned by the pipeline)
@@ -348,15 +406,20 @@ private:
     QTimer m_retryTimer;
     QTimer m_watchdog;
 
-    // surface
-    QPointer<QObject> m_surface;
-    QPointer<QQuickItem> m_glItem;
-    QPointer<QVideoSink> m_videoSink;
-    bool m_sinkReady = false;
-    QMetaObject::Connection m_surfaceConn;
+    // surfaces (see surfaceIndex)
+    struct Surface {
+        QPointer<QObject> obj;
+        QPointer<QQuickItem> glItem;
+        QPointer<QVideoSink> videoSink;
+        bool ready = false;
+        QMetaObject::Connection conn;
+    };
+    Surface m_surf[2];
+    int m_activeSurf = 0;
 
-    // latest frame for the QVideoSink path (coalesced: never queue up)
+    // latest frame per surface for the QVideoSink path (coalesced: never queue up)
     QMutex m_frameMutex;
-    QVideoFrame m_latestFrame;
-    bool m_framePosted = false;
+    QVideoFrame m_latestFrame[2];
+    quint64 m_frameGen[2] = {0, 0};
+    bool m_framePosted[2] = {false, false};
 };

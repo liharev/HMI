@@ -303,6 +303,8 @@ void AppController::load()
     if (f.open(QIODevice::ReadOnly)) {
         const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
         m_hwCapacity = root.value(QLatin1String("hwCapacity")).toDouble(0);
+        const QJsonObject settings = root.value(QLatin1String("settings")).toObject();
+        Player::setWaitTimeout(settings.value(QLatin1String("streamWaitMs")).toInt(3000));
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
         // Automatic decisions are only valid for the environment they were
@@ -315,6 +317,21 @@ void AppController::load()
             qInfo("Kernel/decoders changed (%s): automatic decoder/output decisions reset",
                   qPrintable(decoderEnvironment()));
         }
+    }
+    // Developer aid: HMI_TEST_SWITCH="url1;url2;..." switches every player
+    // to the next address every HMI_TEST_SWITCH_SEC seconds (default 6).
+    if (qEnvironmentVariableIsSet("HMI_TEST_SWITCH")) {
+        const QStringList urls = qEnvironmentVariable("HMI_TEST_SWITCH").split(QLatin1Char(';'), Qt::SkipEmptyParts);
+        const int sec = qMax(1, qEnvironmentVariableIntValue("HMI_TEST_SWITCH_SEC") > 0
+                                    ? qEnvironmentVariableIntValue("HMI_TEST_SWITCH_SEC") : 6);
+        auto *t = new QTimer(this);
+        auto step = std::make_shared<int>(0);
+        connect(t, &QTimer::timeout, this, [this, urls, step] {
+            ++*step;
+            for (Player *p : allPlayers())
+                p->switchStream(urls.at(*step % urls.size()), QStringLiteral("тест"));
+        });
+        t->start(sec * 1000);
     }
     if (m_windows.isEmpty()) {
         newWindow();
@@ -586,6 +603,20 @@ void AppController::scheduleSave()
         m_saveTimer.start();
 }
 
+int AppController::streamWaitMs() const
+{
+    return Player::waitTimeout();
+}
+
+void AppController::setStreamWaitMs(int ms)
+{
+    if (ms == Player::waitTimeout())
+        return;
+    Player::setWaitTimeout(ms);
+    Q_EMIT settingsChanged();
+    scheduleSave();
+}
+
 void AppController::save()
 {
     m_saveTimer.stop();
@@ -594,6 +625,7 @@ void AppController::save()
         arr.append(w->toJson());
     QJsonObject root{{QStringLiteral("version"), 1}, {QStringLiteral("windows"), arr},
                      {QStringLiteral("hwCapacity"), m_hwCapacity},
+                     {QStringLiteral("settings"), QJsonObject{{QStringLiteral("streamWaitMs"), Player::waitTimeout()}}},
                      {QStringLiteral("decoderEnv"), decoderEnvironment()}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);

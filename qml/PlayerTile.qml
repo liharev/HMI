@@ -21,7 +21,6 @@ Item {
     property real dragX: 0
     property real dragY: 0
     property int zOrder: 0
-    property var surface: null       // QObject passed to the player (sink key)
 
     // Size when expanded to the whole viewport (aspect preserved).
     readonly property real expW: viewport ? Math.min(viewport.width - 8, (viewport.height - 8) * player.aspect) : 0
@@ -94,40 +93,67 @@ Item {
         VideoOutput { anchors.fill: parent; fillMode: VideoOutput.PreserveAspectFit }
     }
 
-    property var surfaceItem: null
-    function createSurface() {
-        if (surfaceItem) {
-            if (surface)
-                player.detachSink(surface)
+    // Two surfaces: the shown one and the one a new stream is prepared on
+    // (switching without a black frame). Only the shown one is visible.
+    property var surfaceItems: [null, null]
+    property var surfaces: [null, null]          // objects passed to the player
+    readonly property var surfaceItem: surfaceItems[player.surfaceIndex]
+    readonly property var surface: surfaces[player.surfaceIndex]
+    function destroySurfaces() {
+        for (let i = 0; i < 2; ++i) {
+            const it = surfaceItems[i]
+            if (!it)
+                continue
+            if (surfaces[i])
+                player.detachSink(surfaces[i])
             // GstGLQt6VideoItem crashes if it is destroyed while still
             // parented (its windowChanged handler runs during destruction):
             // unparent it first, while it is fully alive.
-            surfaceItem.parent = null
-            surfaceItem.destroy()
-            surfaceItem = null
-            surface = null
+            it.parent = null
+            it.destroy()
         }
-        if (App.glSink && !player.useQtSink) {
-            try {
-                const item = Qt.createQmlObject(
-                    'import org.freedesktop.gstreamer.Qt6GLVideoItem 1.0; GstGLQt6VideoItem { anchors.fill: parent }',
-                    surfaceHolder, "GlVideoSurface")
-                // The GL item accepts hover/mouse events itself (navigation
-                // events); disable that so the tile's handlers get them.
-                item.enabled = false
-                surfaceItem = item
-                surface = item
-                player.attachGlItem(item)
-                return
-            } catch (e) {
-                console.warn("GstGLQt6VideoItem unavailable, using VideoOutput:", e)
+        surfaceItems = [null, null]
+        surfaces = [null, null]
+    }
+    function createSurface() {
+        destroySurfaces()
+        const items = [null, null]
+        const objs = [null, null]
+        let gl = App.glSink && !player.useQtSink
+        for (let i = 0; i < 2; ++i) {
+            if (gl) {
+                try {
+                    const item = Qt.createQmlObject(
+                        'import org.freedesktop.gstreamer.Qt6GLVideoItem 1.0; GstGLQt6VideoItem { anchors.fill: parent }',
+                        surfaceHolder, "GlVideoSurface" + i)
+                    // The GL item accepts hover/mouse events itself (navigation
+                    // events); disable that so the tile's handlers get them.
+                    item.enabled = false
+                    items[i] = item
+                    objs[i] = item
+                    continue
+                } catch (e) {
+                    console.warn("GstGLQt6VideoItem unavailable, using VideoOutput:", e)
+                    gl = false
+                }
             }
+            const vo = qtSurfaceComponent.createObject(surfaceHolder)
+            vo.enabled = false
+            items[i] = vo
+            objs[i] = vo.videoSink
         }
-        const vo = qtSurfaceComponent.createObject(surfaceHolder)
-        vo.enabled = false
-        surfaceItem = vo
-        surface = vo.videoSink
-        player.attachVideoSink(vo.videoSink)
+        for (let i = 0; i < 2; ++i) {
+            const idx = i
+            items[i].visible = Qt.binding(() => tile.player.surfaceIndex === idx)
+        }
+        surfaceItems = items
+        surfaces = objs
+        for (let i = 0; i < 2; ++i) {
+            if (gl)
+                player.attachGlItem(items[i], i)
+            else
+                player.attachVideoSink(objs[i], i)
+        }
     }
     Component.onCompleted: createSurface()
     // Automatic fallback (GL upload too slow) switches to Qt Multimedia.
@@ -135,14 +161,17 @@ Item {
         target: tile.player
         function onRenderPathChanged() {
             const wantQt = !App.glSink || tile.player.useQtSink
-            const isQt = tile.surfaceItem && tile.surface !== tile.surfaceItem
+            const isQt = tile.surfaceItems[0] && tile.surfaces[0] !== tile.surfaceItems[0]
             if (wantQt !== isQt)
                 tile.createSurface()
         }
     }
     Component.onDestruction: {
-        if (player && surface)
-            player.detachSink(surface)
+        if (player) {
+            for (let i = 0; i < 2; ++i)
+                if (surfaces[i])
+                    player.detachSink(surfaces[i])
+        }
     }
 
     // ---------------------------------------------------------------- mouse
@@ -178,34 +207,68 @@ Item {
     }
 
     // ---------------------------------------------------------------- status
+    // Shown only when there is nothing current to look at: the last frame
+    // stays visible while a stream (re)connects or switches, the panel
+    // appears after the "waiting for the stream" time. Its text shrinks to
+    // fit, so it never leaves the tile.
     Rectangle {
-        anchors.fill: parent
-        color: "#cc111316"
-        visible: tile.player.status !== Player.Playing
+        id: statusPanel
+        visible: tile.player.overlayVisible
+        readonly property bool busy: tile.player.status === Player.Connecting
+                                     || tile.player.status === Player.Reconnecting || tile.player.switching
+        readonly property bool showBusy: busy && tile.height >= 150 && tile.width >= 150
+        readonly property bool showStart: tile.player.status === Player.Stopped && tile.player.url.length > 0
+                                          && tile.height >= 90
+        readonly property real pad: Math.max(3, Math.min(8, tile.height / 20))
+        readonly property real extras: (showBusy ? busyInd.height + 4 : 0) + (showStart ? startBtn.height + 4 : 0)
+        anchors.centerIn: parent
+        width: Math.max(10, Math.min(tile.width - 8, 440))
+        height: Math.max(10, Math.min(tile.height - 8, statusMetrics.height + extras + 2 * pad))
+        radius: Math.min(6, height / 4)
+        color: tile.player.status === Player.Playing ? "#b3111316" : "#d9111316"
+        border.color: tile.player.status === Player.Reconnecting ? "#7c2d12" : "#374151"
+        border.width: 1
+        clip: true
+        z: 5
+
+        // Height the text needs at the normal size (the panel grows up to the tile).
+        Text {
+            id: statusMetrics
+            visible: false
+            width: statusPanel.width - 2 * statusPanel.pad
+            text: statusText.text
+            font.pixelSize: 13
+            wrapMode: Text.Wrap
+        }
         Column {
-            anchors.centerIn: parent
-            width: parent.width - 20
-            spacing: 6
+            anchors.fill: parent
+            anchors.margins: statusPanel.pad
+            spacing: 4
             BusyIndicator {
+                id: busyInd
                 anchors.horizontalCenter: parent.horizontalCenter
+                visible: statusPanel.showBusy
                 running: visible
-                visible: (tile.player.status === Player.Connecting || tile.player.status === Player.Reconnecting)
-                         && tile.height > 120
-                width: 36; height: 36
+                width: 32; height: 32
             }
             Text {
+                id: statusText
                 width: parent.width
-                text: tile.player.statusText
+                height: Math.max(6, parent.height - statusPanel.extras)
+                text: tile.player.overlayText
                 color: tile.player.status === Player.Reconnecting ? "#fdba74" : "#d1d5db"
                 font.pixelSize: 13
+                fontSizeMode: Text.Fit
+                minimumPixelSize: 6
                 horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.Wrap
-                maximumLineCount: 4
                 elide: Text.ElideRight
             }
             Button {
+                id: startBtn
                 anchors.horizontalCenter: parent.horizontalCenter
-                visible: tile.player.status === Player.Stopped && tile.player.url.length > 0
+                visible: statusPanel.showStart
                 text: "▶ Запустить"
                 onClicked: tile.player.start()
             }
@@ -234,7 +297,8 @@ Item {
     readonly property real refFps: player.nominalFps > 0 ? player.nominalFps : Math.max(player.inFps, player.fps)
     Rectangle {
         id: healthPill
-        visible: tile.player.health !== Player.HealthNone
+        // The status panel carries the same information when it is shown.
+        visible: tile.player.health !== Player.HealthNone && !tile.player.overlayVisible
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.rightMargin: 6

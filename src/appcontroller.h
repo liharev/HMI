@@ -37,6 +37,10 @@ class AppController : public QObject
     Q_PROPERTY(QVariantList builtinWallpapers READ builtinWallpapers CONSTANT)
     Q_PROPERTY(QString decoderBalance READ decoderBalance NOTIFY decoderBalanceChanged)
     Q_PROPERTY(Diagnostics *diag READ diag CONSTANT)
+    // Application settings ("Настройки программы").
+    // Waiting for the video stream: the last frame is kept this long before
+    // the exchange status is shown over the player.
+    Q_PROPERTY(int streamWaitMs READ streamWaitMs WRITE setStreamWaitMs NOTIFY settingsChanged)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -55,6 +59,8 @@ public:
     QVariantList builtinWallpapers() const;
     QString decoderBalance() const { return m_balanceText; }
     Diagnostics *diag() const { return m_diag; }
+    int streamWaitMs() const;
+    void setStreamWaitMs(int ms);
     QList<Player *> allPlayers() const;
     QString decoderEnvironment() const;   // kernel + available hardware decoders
     bool balanceOff() const { return m_balanceOff; }
@@ -79,6 +85,7 @@ Q_SIGNALS:
     void screensChanged();
     void glInfoChanged();
     void decoderBalanceChanged();
+    void settingsChanged();
 
 private:
     void addWindow(VmsWindow *w);
