@@ -1,4 +1,5 @@
 #include "player.h"
+#include "camai.h"
 #include "gstutils.h"
 
 #include <QCoreApplication>
@@ -684,6 +685,8 @@ Player::Player(QObject *parent)
 
 Player::~Player()
 {
+    if (m_camai)
+        m_camai->removeUser(this);
     m_retryTimer.stop();
     teardown(false);
 }
@@ -727,6 +730,11 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     }
     p->m_profilePin = o.value(QLatin1String("profilePin")).toString();
     p->m_z = o.value(QLatin1String("z")).toInt(0);
+    const QJsonObject camai = o.value(QLatin1String("camai")).toObject();
+    p->m_camaiService = camai.value(QLatin1String("service")).toString();
+    p->m_camaiChannel = camai.value(QLatin1String("channel")).toInt(-1);
+    p->m_camaiRtspHost = camai.value(QLatin1String("rtspHost")).toString();
+    p->bindCamai();
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -772,6 +780,10 @@ QJsonObject Player::toJson() const
         o.insert(QLatin1String("profilePin"), m_profilePin);
     if (m_z)
         o.insert(QLatin1String("z"), m_z);
+    if (!m_camaiService.isEmpty())
+        o.insert(QLatin1String("camai"), QJsonObject{{QStringLiteral("service"), m_camaiService},
+                                                     {QStringLiteral("channel"), m_camaiChannel},
+                                                     {QStringLiteral("rtspHost"), m_camaiRtspHost}});
     return o;
 }
 
@@ -934,6 +946,9 @@ QVariantMap Player::config() const
         {QStringLiteral("flipV"), m_flipV},
         {QStringLiteral("profiles"), profilesVariant()},
         {QStringLiteral("profilePin"), m_profilePin},
+        {QStringLiteral("camaiService"), m_camaiService},
+        {QStringLiteral("camaiChannel"), m_camaiChannel},
+        {QStringLiteral("camaiRtspHost"), m_camaiRtspHost},
     };
 }
 
@@ -994,6 +1009,11 @@ void Player::applyConfig(const QVariantMap &c)
     }
     if (profilesEdited)
         Q_EMIT profilesChanged();
+    const QString camaiService = c.value(QStringLiteral("camaiService"), m_camaiService).toString().trimmed();
+    const int camaiChannel = c.value(QStringLiteral("camaiChannel"), m_camaiChannel).toInt();
+    const QString camaiHost = c.value(QStringLiteral("camaiRtspHost"), m_camaiRtspHost).toString().trimmed();
+    const bool camaiChanged = camaiService != m_camaiService || camaiChannel != m_camaiChannel
+                              || camaiHost != m_camaiRtspHost || user != m_username || pass != m_password;
     const bool otherStreamChanged = user != m_username || pass != m_password
                                     || transport != m_transport || latency != m_latency
                                     || decoder != m_decoder || lowLatency != m_lowLatency;
@@ -1011,6 +1031,12 @@ void Player::applyConfig(const QVariantMap &c)
         m_balancedSw = false;
     m_decoder = decoder;
     m_lowLatency = lowLatency;
+    if (camaiChanged) {
+        m_camaiService = camaiService;
+        m_camaiChannel = camaiChannel;
+        m_camaiRtspHost = camaiHost;
+        bindCamai();
+    }
     Q_EMIT configChanged();
     Q_EMIT persistentChanged();
     if (otherStreamChanged || outputChanged) {
@@ -2039,7 +2065,10 @@ void Player::scheduleRetry(const QString &reason)
         ++m_retry;
     }
     m_lastError = text;
-    if (!m_gotFrame && m_retry >= 2 && m_profiles.size() > 1 && m_profilePin.isEmpty()) {
+    // Only errors of this particular stream (503, 404) make another profile
+    // worth trying; an unreachable server affects all of them alike.
+    const bool streamSpecific = text.contains(QLatin1String("(503)")) || text.contains(QLatin1String("(404)"));
+    if (!m_gotFrame && m_retry >= 2 && streamSpecific && m_profiles.size() > 1 && m_profilePin.isEmpty()) {
         // This stream of the camera does not work: use another one for a while.
         m_failedUntil.insert(m_streamUrl, QDateTime::currentMSecsSinceEpoch() + 60000);
         QTimer::singleShot(61000, this, [this] { m_selectTimer.start(); });
@@ -2302,6 +2331,10 @@ void Player::updateHealth()
             h = HealthWarning;
             t = QStringLiteral("Аппаратный декодер не справился, работает программный");
         }
+        if (!m_sourceNote.isEmpty() && h < HealthWarning) {
+            h = HealthWarning;
+            t = m_sourceNote;
+        }
         if (!m_fallbackNote.isEmpty())
             t += QStringLiteral("\nВывод: ") + renderPath() + QStringLiteral(" (") + m_fallbackNote + QLatin1Char(')');
         break;
@@ -2340,6 +2373,10 @@ static QString explainError(const QString &msg)
 
 void Player::onPipelineError(quint64 gen, const QString &msg)
 {
+    // A CAMAI profile that disappeared (device reconfigured): new catalogue.
+    if (m_camai && (isActive(gen) || isPending(gen))
+        && (msg.contains(QLatin1String("Not Found")) || msg.contains(QLatin1String("(404)"))))
+        m_camai->refreshCatalog();
     if (isPending(gen))
         failPending(explainError(msg));
     else if (isActive(gen))
@@ -2529,6 +2566,81 @@ void Player::setVisibility(bool visible, int hideDelayMs, const QString &reason)
         m_wantHidden = true;
         m_hideTimer.start(qMax(0, hideDelayMs));
     }
+}
+
+// ---------------------------------------------------------------------------
+// CAMAI devices: profiles from the device catalogue, input state from /status
+// ---------------------------------------------------------------------------
+void Player::bindCamai()
+{
+    if (m_camai) {
+        disconnect(m_camai, nullptr, this, nullptr);
+        m_camai->removeUser(this);
+        m_camai = nullptr;
+    }
+    if (m_camaiService.isEmpty() || m_camaiChannel < 0) {
+        setSourceNote(QString());
+        return;
+    }
+    m_camai = CamaiService::get(m_camaiService, m_username, m_password);
+    if (!m_camai)
+        return;
+    m_camai->setRtspHost(m_camaiRtspHost);
+    connect(m_camai, &CamaiService::catalogChanged, this, &Player::onCamaiCatalog);
+    connect(m_camai, &CamaiService::statusChanged, this, &Player::onCamaiStatus);
+    m_camai->addUser(this);
+    if (m_camai->catalogKnown())
+        onCamaiCatalog();
+    onCamaiStatus();
+}
+
+void Player::onCamaiCatalog()
+{
+    if (!m_camai)
+        return;
+    const QList<StreamProfile> list = m_camai->profiles(m_camaiChannel);
+    if (list.isEmpty()) {
+        setSourceNote(QStringLiteral("Канала %1 нет в каталоге устройства CAMAI").arg(m_camaiChannel));
+        return;
+    }
+    setDiscoveredProfiles(QStringLiteral("camai"), list);
+    // Main address (used when the automatic choice is off): stream 0.
+    if (profiles::indexOf(list, m_url) < 0) {
+        QString main = list.first().url;
+        for (const StreamProfile &sp : list) {
+            if (sp.kind == QLatin1String("stream")) {
+                main = sp.url;
+                break;
+            }
+        }
+        m_url = main;
+        Q_EMIT configChanged();
+        Q_EMIT persistentChanged();
+    }
+    onCamaiStatus();
+}
+
+void Player::onCamaiStatus()
+{
+    if (!m_camai)
+        return;
+    const CamaiService::ChannelState st = m_camai->state(m_camaiChannel);
+    QString note;
+    if (st.known && !st.signal)
+        note = st.splash ? QStringLiteral("Нет сигнала на входе камеры — сервер показывает заставку")
+                         : QStringLiteral("Нет сигнала на входе камеры");
+    if (m_camai->catalogKnown() && m_camai->profiles(m_camaiChannel).isEmpty())
+        note = QStringLiteral("Канала %1 нет в каталоге устройства CAMAI").arg(m_camaiChannel);
+    setSourceNote(note);
+}
+
+void Player::setSourceNote(const QString &n)
+{
+    if (n == m_sourceNote)
+        return;
+    m_sourceNote = n;
+    Q_EMIT sourceNoteChanged();
+    updateHealth();
 }
 
 // Profiles entered without parameters are examined in the background (once

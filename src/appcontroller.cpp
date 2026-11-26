@@ -2,6 +2,7 @@
 #include "diagnostics.h"
 #include "gstutils.h"
 #include "player.h"
+#include "camai.h"
 #include "streamprofile.h"
 #include <QUrl>
 #include "vmswindow.h"
@@ -755,6 +756,20 @@ void AppController::settingsUpdated()
     scheduleSave();
     for (Player *p : allPlayers())
         p->reevaluateProfile();
+}
+
+int AppController::camaiChannels(const QString &service, const QString &user, const QString &password)
+{
+    const int id = ++m_probeId;
+    CamaiService::fetchChannels(service, user, password, this, [this, id](const QVariantList &list, const QString &err) {
+        Q_EMIT camaiChannelsReady(id, list, err);
+    });
+    return id;
+}
+
+QString AppController::camaiNormalize(const QString &service) const
+{
+    return CamaiService::normalize(service);
 }
 
 int AppController::probeStream(const QString &url, const QString &user, const QString &password)

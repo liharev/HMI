@@ -29,6 +29,7 @@ class QVideoSink;
 class QNetworkAccessManager;
 class QNetworkReply;
 class QWebSocket;
+class CamaiService;
 struct PipelineCtx;
 
 class Player : public QObject
@@ -110,6 +111,11 @@ class Player : public QObject
     // its stream is stopped until it becomes visible again.
     Q_PROPERTY(bool hidden READ hidden NOTIFY hiddenChanged)
     Q_PROPERTY(QString hiddenReason READ hiddenReason NOTIFY hiddenChanged)
+    // CAMAI source: device service URL and channel (profiles come from its catalogue).
+    Q_PROPERTY(QString camaiService READ camaiService NOTIFY configChanged)
+    Q_PROPERTY(int camaiChannel READ camaiChannel NOTIFY configChanged)
+    // State of the source reported by the device (e.g. no signal on its input).
+    Q_PROPERTY(QString sourceNote READ sourceNote NOTIFY sourceNoteChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -270,6 +276,10 @@ public:
     // A player that must keep playing when nobody sees it (e.g. its sound is on).
     bool keepWhenHidden() const { return false; }
 
+    QString camaiService() const { return m_camaiService; }
+    int camaiChannel() const { return m_camaiChannel; }
+    QString sourceNote() const { return m_sourceNote; }
+
     // Video surface handling (called from QML).
     Q_INVOKABLE void attachGlItem(QQuickItem *item, int index = 0);
     Q_INVOKABLE void attachVideoSink(QVideoSink *sink, int index = 0);
@@ -301,6 +311,7 @@ Q_SIGNALS:
     void profilesChanged();
     void zOrderChanged();
     void hiddenChanged();
+    void sourceNoteChanged();
     void profileTextChanged();
     // The prepared stream could not be opened; the current one is kept.
     void switchFailed(const QString &url, const QString &reason);
@@ -335,6 +346,10 @@ private:
     void learnProfile();
     void setProfileText(const QString &t);
     void probeUnknownProfiles();
+    void bindCamai();
+    void onCamaiCatalog();
+    void onCamaiStatus();
+    void setSourceNote(const QString &n);
     void setStatus(Status s, const QString &text = QString());
     void setActive(bool a);
     void scheduleGlReady(int index);
@@ -443,6 +458,12 @@ private:
     bool m_wantHidden = false;          // invisible, waiting for the delay
     QString m_hiddenReason;
     QTimer m_hideTimer;
+    // CAMAI
+    QString m_camaiService;
+    int m_camaiChannel = -1;
+    QString m_camaiRtspHost;
+    QPointer<CamaiService> m_camai;
+    QString m_sourceNote;
     QString m_lastError;        // shown while reconnecting
     QString m_stage;            // exchange status of the connecting stream
     QString m_pendingStage;     // ... of the prepared stream

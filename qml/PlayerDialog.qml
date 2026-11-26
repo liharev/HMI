@@ -16,6 +16,13 @@ Dialog {
     property string pin: ""
     property var probing: ({})           // probe id -> url
     property int probesRunning: 0
+    // Source: 0 - stream address, 1 - CAMAI device (channels from its catalogue).
+    property int mode: 0
+    property var camaiList: []
+    property var camaiChecked: ({})
+    property string camaiError: ""
+    property bool camaiBusy: false
+    property int camaiReq: -1
 
     FontMetrics { id: fm; font: dlg.font }
     readonly property real em: fm.height
@@ -50,10 +57,92 @@ Dialog {
         probing = ({})
         probesRunning = 0
         newProfileField.text = ""
+        mode = c.camaiService ? 1 : 0
+        camaiField.text = c.camaiService || ""
+        camaiHostField.text = c.camaiRtspHost || ""
+        camaiList = []
+        camaiError = ""
+        camaiBusy = false
+        const chk = {}
+        if (c.camaiService)
+            chk[c.camaiChannel] = true
+        camaiChecked = chk
+        if (mode === 1)
+            loadCamai()
         scroll.ScrollBar.vertical.position = 0
         open()
         urlField.forceActiveFocus()
         urlField.selectAll()
+    }
+
+    function camaiSelected() { return camaiList.filter(ch => !!camaiChecked[ch.id]) }
+    function loadCamai() {
+        if (!camaiField.text.trim().length)
+            return
+        camaiBusy = true
+        camaiError = ""
+        camaiReq = App.camaiChannels(camaiField.text, userField.text, passField.text)
+    }
+    function toggleChannel(id, on) {
+        // Editing a player: one channel; adding: any number (one player each).
+        const chk = player ? {} : Object.assign({}, camaiChecked)
+        chk[id] = on
+        camaiChecked = chk
+    }
+    function channelSummary(ch) {
+        const streams = ch.profiles.filter(p => p.kind !== "preview").map(p => p.width + "×" + p.height
+                                                                            + (p.codec ? " " + p.codec.toUpperCase() : ""))
+        const previews = ch.profiles.filter(p => p.kind === "preview").map(p => p.label || (p.height + "p"))
+        let t = (ch.signal ? "" : (ch.splash ? "нет сигнала (заставка) · " : "нет сигнала · "))
+        t += "потоки: " + (streams.length ? streams.join(", ") : "—")
+        if (previews.length)
+            t += " · превью: " + previews.join(", ")
+        return t
+    }
+    Connections {
+        target: App
+        function onCamaiChannelsReady(id, list, error) {
+            if (id !== dlg.camaiReq)
+                return
+            dlg.camaiBusy = false
+            dlg.camaiError = error
+            dlg.camaiList = list
+            if (!dlg.player && list.length && Object.keys(dlg.camaiChecked).length === 0) {
+                const chk = {}
+                for (const ch of list)
+                    chk[ch.id] = true          // adding: all channels by default
+                dlg.camaiChecked = chk
+            }
+        }
+    }
+
+    function acceptCamai(base) {
+        const svc = App.camaiNormalize(camaiField.text)
+        const host = svc.replace(/^[a-z]+:\/\//i, "").replace(/:\d+$/, "")
+        const sel = camaiSelected()
+        if (player && sel.length === 0) {
+            // Catalogue not loaded: keep the channel, save the other settings.
+            player.applyConfig(base)
+            return
+        }
+        for (const ch of sel) {
+            const profs = ch.profiles
+            const main = profs.find(x => x.kind === "stream") || profs[0]
+            const own = sel.length === 1 && nameField.text.trim().length > 0
+            const cfg = Object.assign({}, base, {
+                url: main ? main.url : "",
+                name: own ? nameField.text.trim() : "CAMAI " + host + " · канал " + ch.id,
+                camaiService: svc,
+                camaiChannel: ch.id,
+                camaiRtspHost: camaiHostField.text.trim(),
+                profiles: profs,
+                profilePin: player && player.camaiChannel === ch.id ? base.profilePin : ""
+            })
+            if (player)
+                player.applyConfig(cfg)
+            else
+                win.addPlayer(cfg)
+        }
     }
 
     function accept_() {
@@ -75,12 +164,23 @@ Dialog {
             profiles: profs,
             profilePin: pinBox.currentIndex > 0 ? profs[pinBox.currentIndex - 1].url : ""
         }
+        if (mode === 1) {
+            delete cfg.url
+            delete cfg.profiles
+            acceptCamai(cfg)
+            close()
+            return
+        }
+        cfg.camaiService = ""
+        cfg.camaiChannel = -1
         if (player)
             player.applyConfig(cfg)
         else
             win.addPlayer(cfg)
         close()
     }
+    readonly property bool canAccept: mode === 0 ? urlValid
+                                                 : (camaiSelected().length > 0 || (!!player && camaiField.text.trim().length > 0))
 
     function profileIndex(u) {
         for (let i = 0; i < profs.length; ++i)
@@ -215,7 +315,24 @@ Dialog {
             columnSpacing: Math.round(dlg.em * 0.7)
             rowSpacing: Math.round(dlg.em * 0.4)
 
-            Section { text: "Поток"; Layout.topMargin: 0 }
+            Section { text: "Источник"; Layout.topMargin: 0 }
+            TabBar {
+                id: modeBar
+                Layout.columnSpan: 2
+                Layout.fillWidth: true
+                currentIndex: dlg.mode
+                onCurrentIndexChanged: {
+                    if (currentIndex === dlg.mode)
+                        return
+                    dlg.mode = currentIndex
+                    if (dlg.mode === 1 && !dlg.player)
+                        transportBox.currentIndex = 1      // CAMAI: RTSP over TCP
+                }
+                TabButton { text: "Адрес потока" }
+                TabButton { text: "Устройство CAMAI" }
+            }
+
+            Section { text: "Поток" }
 
             Label { text: "Название" }
             Field {
@@ -223,19 +340,79 @@ Dialog {
                 placeholderText: "по умолчанию — адрес камеры"
             }
 
-            Label { text: "Адрес потока" }
+            Label { text: "Адрес потока"; visible: dlg.mode === 0 }
             Field {
                 id: urlField
+                visible: dlg.mode === 0
                 placeholderText: "rtsp://192.168.1.64:554/Streaming/Channels/101"
                 onAccepted: if (dlg.urlValid) dlg.accept_()
             }
 
-            Item { implicitWidth: 1; implicitHeight: 1 }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.mode === 0 }
             Hint {
+                visible: dlg.mode === 0
                 textFormat: Text.StyledText
                 text: (dlg.protocol ? "Протокол: <b>" + dlg.protocol + "</b><br>" : "")
                       + "RTSP; HLS (.m3u8), DASH (.mpd), MSS (.isml/manifest), MPEG-TS и MJPEG по HTTP; "
                       + "JPEG-снимки (.jpg); MSE-LD (ws://…/mse_ld); m4s:// и m4f:// Flussonic; test://ball."
+            }
+
+            // ---- CAMAI device
+            Label { text: "Адрес устройства"; visible: dlg.mode === 1 }
+            RowLayout {
+                visible: dlg.mode === 1
+                Layout.fillWidth: true
+                Layout.preferredWidth: dlg.em * 4
+                Field {
+                    id: camaiField
+                    placeholderText: "192.168.53.168 или http://192.168.53.168:8080"
+                    onAccepted: dlg.loadCamai()
+                }
+                Button {
+                    text: dlg.camaiBusy ? "Запрос…" : "Получить каналы"
+                    enabled: !dlg.camaiBusy && camaiField.text.trim().length > 0
+                    onClicked: dlg.loadCamai()
+                }
+            }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.mode === 1 }
+            Hint {
+                visible: dlg.mode === 1
+                color: dlg.camaiError ? "#fca5a5" : palette.windowText
+                text: dlg.camaiError ? "Ошибка: " + dlg.camaiError
+                      : dlg.camaiList.length ? (dlg.player ? "Выберите канал этого плеера."
+                                                           : "Отметьте каналы: для каждого будет добавлен плеер. "
+                                                             + "Поток подбирается автоматически по размеру плеера.")
+                      : "Сервис превью CAMAI (порт 8080). Логин и пароль ниже — если на устройстве включена авторизация."
+            }
+            Repeater {
+                model: dlg.mode === 1 ? dlg.camaiList : []
+                delegate: CheckBox {
+                    required property var modelData
+                    Layout.columnSpan: 2
+                    Layout.fillWidth: true
+                    // The text keeps the indicator on the left (Fusion centres it otherwise).
+                    text: "Канал " + modelData.id
+                    checked: !!dlg.camaiChecked[modelData.id]
+                    onToggled: dlg.toggleChannel(modelData.id, checked)
+                    contentItem: Column {
+                        leftPadding: parent.indicator.width + parent.spacing
+                        Label { text: "Канал " + modelData.id; font.bold: true }
+                        Label {
+                            width: dlg.availableWidth - dlg.em * 3
+                            wrapMode: Text.Wrap
+                            opacity: 0.7
+                            font.pixelSize: Math.max(10, Math.round(dlg.em * 0.68))
+                            color: modelData.signal ? palette.windowText : "#fbbf24"
+                            text: dlg.channelSummary(modelData)
+                        }
+                    }
+                }
+            }
+            Label { text: "RTSP через прокси"; visible: dlg.mode === 1 }
+            Field {
+                id: camaiHostField
+                visible: dlg.mode === 1
+                placeholderText: "адрес:порт — если устройство видно под другим адресом"
             }
 
             Label { text: "Логин" }
@@ -256,32 +433,32 @@ Dialog {
                 }
             }
 
-            Label { text: "Транспорт RTSP"; visible: dlg.isRtsp }
+            Label { text: "Транспорт RTSP"; visible: dlg.isRtsp || dlg.mode === 1 }
             ComboBox {
                 id: transportBox
-                visible: dlg.isRtsp
+                visible: dlg.isRtsp || dlg.mode === 1
                 Layout.fillWidth: true
                 Layout.preferredWidth: dlg.em * 4
                 model: ["Авто (UDP, при неудаче TCP)", "TCP (надёжно через NAT/VPN)", "UDP (минимальная задержка)"]
             }
 
-            Label { text: "Буфер, мс"; visible: dlg.isRtsp }
+            Label { text: "Буфер, мс"; visible: dlg.isRtsp || dlg.mode === 1 }
             SpinBox {
                 id: latencySpin
-                visible: dlg.isRtsp
+                visible: dlg.isRtsp || dlg.mode === 1
                 from: 0; to: 5000; stepSize: 50
                 editable: true
             }
-            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.isRtsp }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.isRtsp || dlg.mode === 1 }
             Hint {
-                visible: dlg.isRtsp
+                visible: dlg.isRtsp || dlg.mode === 1
                 text: "Джиттер-буфер RTP: меньше — ниже задержка, больше — устойчивее к потерям пакетов."
             }
 
-            Label { text: "Обновление снимка, мс"; visible: dlg.isSnapshot }
+            Label { text: "Обновление снимка, мс"; visible: dlg.isSnapshot && dlg.mode === 0 }
             SpinBox {
                 id: snapshotSpin
-                visible: dlg.isSnapshot
+                visible: dlg.isSnapshot && dlg.mode === 0
                 from: 100; to: 60000; stepSize: 100
                 editable: true
             }
@@ -322,10 +499,11 @@ Dialog {
                       + "попадать на экран, и запоминает его."
             }
 
-            Section { text: "Качество: потоки камеры" }
+            Section { text: "Качество: потоки камеры"; visible: dlg.mode === 0 || !!dlg.player }
 
-            Item { implicitWidth: 1; implicitHeight: 1 }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.mode === 0 }
             Hint {
+                visible: dlg.mode === 0
                 text: "Если камера отдаёт несколько потоков (например, 4K, 1080p и 360p), перечислите их: "
                       + "плеер сам выберет самый лёгкий поток, которого достаточно для его размера на экране, "
                       + "и переключится без чёрного экрана при изменении размера. Список CAMAI, ONVIF и "
@@ -333,7 +511,7 @@ Dialog {
             }
 
             Repeater {
-                model: dlg.profs
+                model: dlg.mode === 0 || dlg.player ? dlg.profs : []
                 delegate: RowLayout {
                     required property var modelData
                     required property int index
@@ -372,8 +550,9 @@ Dialog {
                 }
             }
 
-            Label { text: "Добавить поток" }
+            Label { text: "Добавить поток"; visible: dlg.mode === 0 }
             RowLayout {
+                visible: dlg.mode === 0
                 Layout.fillWidth: true
                 Layout.preferredWidth: dlg.em * 4
                 Field {
@@ -388,9 +567,9 @@ Dialog {
                 }
             }
 
-            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.profs.length > 0 }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.profs.length > 0 && dlg.mode === 0 }
             Button {
-                visible: dlg.profs.length > 0
+                visible: dlg.profs.length > 0 && dlg.mode === 0
                 text: dlg.probesRunning > 0 ? "Определение… (" + dlg.probesRunning + ")" : "Определить параметры"
                 enabled: dlg.probesRunning === 0
                 onClicked: dlg.forceProbeAll()
@@ -458,8 +637,10 @@ Dialog {
 
     footer: DialogButtonBox {
         Button {
-            text: dlg.player ? "Сохранить" : "Добавить"
-            enabled: dlg.urlValid
+            text: dlg.player ? "Сохранить"
+                  : dlg.mode === 1 && dlg.camaiSelected().length > 1 ? "Добавить (" + dlg.camaiSelected().length + ")"
+                  : "Добавить"
+            enabled: dlg.canAccept
             DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
         }
         Button {

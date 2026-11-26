@@ -72,6 +72,9 @@ public:
     // Reads resolution / frame rate / codec / audio of a stream (async);
     // the result comes with probeFinished(id, ...).
     Q_INVOKABLE int probeStream(const QString &url, const QString &user, const QString &password);
+    // Channels of a CAMAI device (async, result in camaiChannelsReady).
+    Q_INVOKABLE int camaiChannels(const QString &service, const QString &user, const QString &password);
+    Q_INVOKABLE QString camaiNormalize(const QString &service) const;
     QList<Player *> allPlayers() const;
     QString decoderEnvironment() const;   // kernel + available hardware decoders
     bool balanceOff() const { return m_balanceOff; }
@@ -98,6 +101,7 @@ Q_SIGNALS:
     void decoderBalanceChanged();
     void settingsChanged();
     void probeFinished(int id, const QVariantMap &profile, const QString &error);
+    void camaiChannelsReady(int id, const QVariantList &channels, const QString &error);
 
 private:
     void addWindow(VmsWindow *w);

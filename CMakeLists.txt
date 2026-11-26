@@ -25,6 +25,7 @@ qt_add_executable(hmi-vms
     src/gstutils.h src/gstutils.cpp
     src/player.h src/player.cpp
     src/streamprofile.h src/streamprofile.cpp
+    src/camai.h src/camai.cpp
     src/vmswindow.h src/vmswindow.cpp
     src/appcontroller.h src/appcontroller.cpp
     src/diagnostics.h src/diagnostics.cpp

@@ -282,6 +282,32 @@ Item {
         }
     }
 
+    // State of the source reported by the device (e.g. CAMAI: no signal on
+    // the input, the server shows its splash screen).
+    Rectangle {
+        id: sourceNote
+        visible: tile.player.sourceNote.length > 0 && !tile.player.overlayVisible && tile.height >= 80
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: tile.width >= 200 ? 26 : 4
+        width: Math.min(tile.width - 12, noteText.implicitWidth + 16)
+        height: noteText.implicitHeight + 6
+        radius: height / 2
+        color: "#cc422006"
+        border.color: "#f59e0b"
+        z: 6
+        Text {
+            id: noteText
+            anchors.centerIn: parent
+            width: parent.width - 12
+            text: "⚠ " + tile.player.sourceNote
+            color: "#fde68a"
+            font.pixelSize: 11
+            elide: Text.ElideRight
+            horizontalAlignment: Text.AlignHCenter
+        }
+    }
+
     // Camera name (always visible).
     Text {
         anchors.left: parent.left
