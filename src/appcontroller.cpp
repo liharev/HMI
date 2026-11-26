@@ -3,6 +3,7 @@
 #include "gstutils.h"
 #include "player.h"
 #include "camai.h"
+#include "discovery.h"
 #include "streamprofile.h"
 #include <QUrl>
 #include "vmswindow.h"
@@ -764,6 +765,23 @@ int AppController::camaiChannels(const QString &service, const QString &user, co
     CamaiService::fetchChannels(service, user, password, this, [this, id](const QVariantList &list, const QString &err) {
         Q_EMIT camaiChannelsReady(id, list, err);
     });
+    return id;
+}
+
+int AppController::discoverStreams(const QString &kind, const QString &address,
+                                   const QString &user, const QString &password)
+{
+    const int id = ++m_probeId;
+    auto done = [this, id](const QList<StreamProfile> &list, const QString &err) {
+        QVariantList out;
+        for (const StreamProfile &p : list)
+            out << p.toVariant();
+        Q_EMIT discoverFinished(id, out, err);
+    };
+    if (kind == QLatin1String("onvif"))
+        discovery::onvif(address, user, password, this, done);
+    else
+        discovery::flussonic(address, user, password, this, done);
     return id;
 }
 

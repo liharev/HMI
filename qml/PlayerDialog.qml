@@ -23,6 +23,8 @@ Dialog {
     property string camaiError: ""
     property bool camaiBusy: false
     property int camaiReq: -1
+    property int discoverReq: -1
+    property string discoverMsg: ""
 
     FontMetrics { id: fm; font: dlg.font }
     readonly property real em: fm.height
@@ -57,6 +59,9 @@ Dialog {
         probing = ({})
         probesRunning = 0
         newProfileField.text = ""
+        onvifField.text = ""
+        discoverMsg = ""
+        discoverReq = -1
         mode = c.camaiService ? 1 : 0
         camaiField.text = c.camaiService || ""
         camaiHostField.text = c.camaiRtspHost || ""
@@ -227,6 +232,39 @@ Dialog {
             m[id] = profs[i].url
             probing = m
             ++probesRunning
+        }
+    }
+    // Streams offered by the camera (ONVIF) or the Flussonic server.
+    function discover(kind) {
+        discoverMsg = kind === "onvif" ? "Запрос профилей ONVIF…" : "Запрос media_info.json…"
+        const addr = kind === "onvif" ? (onvifField.text.trim() || streamHost) : url_
+        discoverReq = App.discoverStreams(kind, addr, userField.text, passField.text)
+    }
+    Connections {
+        target: App
+        function onDiscoverFinished(id, list, error) {
+            if (id !== dlg.discoverReq)
+                return
+            dlg.discoverReq = -1
+            if (error) {
+                dlg.discoverMsg = "Ошибка: " + error
+                return
+            }
+            const merged = dlg.profs.slice()
+            const mainKnown = list.some(x => x.url === dlg.url_)
+            if (merged.length === 0 && dlg.urlValid && !mainKnown && !/\.m3u8|mpegts|\.mpd/i.test(dlg.url_))
+                merged.push(Object.assign({ label: "основной" }, dlg.learned(dlg.url_)))
+            let added = 0
+            for (const p of list) {
+                if (merged.some(x => x.url === p.url))
+                    continue
+                merged.push(p)
+                ++added
+            }
+            dlg.profs = merged
+            if (!dlg.urlValid && list.length)
+                urlField.text = list[0].url
+            dlg.discoverMsg = "Найдено потоков: " + list.length + (added < list.length ? " (новых " + added + ")" : "")
         }
     }
     function forceProbeAll() {
@@ -565,6 +603,37 @@ Dialog {
                     enabled: newProfileField.text.trim().length > 0
                     onClicked: { dlg.addProfile(newProfileField.text); newProfileField.text = "" }
                 }
+            }
+
+            Label { text: "Найти потоки"; visible: dlg.mode === 0 }
+            RowLayout {
+                visible: dlg.mode === 0
+                Layout.fillWidth: true
+                Layout.preferredWidth: dlg.em * 4
+                Field {
+                    id: onvifField
+                    placeholderText: "адрес ONVIF" + (dlg.streamHost ? " (" + dlg.streamHost + ")" : "")
+                }
+                Button {
+                    text: "ONVIF"
+                    enabled: dlg.discoverReq < 0 && (onvifField.text.trim().length > 0 || dlg.streamHost.length > 0)
+                    onClicked: dlg.discover("onvif")
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Профили камеры по ONVIF (GetProfiles / GetStreamUri) с логином и паролем выше"
+                }
+                Button {
+                    text: "Flussonic"
+                    enabled: dlg.discoverReq < 0 && /^(https?|m4[sf]s?|wss?|rtsp):/i.test(dlg.url_)
+                    onClicked: dlg.discover("flussonic")
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Дорожки разного качества потока Flussonic (media_info.json; нужен транскодер)"
+                }
+            }
+            Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.mode === 0 && dlg.discoverMsg.length > 0 }
+            Hint {
+                visible: dlg.mode === 0 && dlg.discoverMsg.length > 0
+                color: dlg.discoverMsg.indexOf("Ошибка") === 0 ? "#fca5a5" : palette.windowText
+                text: dlg.discoverMsg
             }
 
             Item { implicitWidth: 1; implicitHeight: 1; visible: dlg.profs.length > 0 && dlg.mode === 0 }

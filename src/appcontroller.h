@@ -75,6 +75,10 @@ public:
     // Channels of a CAMAI device (async, result in camaiChannelsReady).
     Q_INVOKABLE int camaiChannels(const QString &service, const QString &user, const QString &password);
     Q_INVOKABLE QString camaiNormalize(const QString &service) const;
+    // Streams offered by a camera / server: kind "onvif" (address = camera
+    // host[:port]) or "flussonic" (address = any URL of the stream).
+    Q_INVOKABLE int discoverStreams(const QString &kind, const QString &address,
+                                    const QString &user, const QString &password);
     QList<Player *> allPlayers() const;
     QString decoderEnvironment() const;   // kernel + available hardware decoders
     bool balanceOff() const { return m_balanceOff; }
@@ -102,6 +106,7 @@ Q_SIGNALS:
     void settingsChanged();
     void probeFinished(int id, const QVariantMap &profile, const QString &error);
     void camaiChannelsReady(int id, const QVariantList &channels, const QString &error);
+    void discoverFinished(int id, const QVariantList &profiles, const QString &error);
 
 private:
     void addWindow(VmsWindow *w);
