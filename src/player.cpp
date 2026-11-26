@@ -319,7 +319,12 @@ struct PipelineCallbacks
         default:
             break;
         }
-        // Nobody pops this bus: drop everything to avoid accumulation.
+        // Nobody pops this bus: drop everything to avoid accumulation. A sync
+        // handler returning GST_BUS_DROP must release the message itself;
+        // without it every message (QoS ones arrive continuously) and the
+        // element it refers to - up to whole stopped pipelines with their
+        // decoder buffers - stayed in memory forever.
+        gst_message_unref(msg);
         return GST_BUS_DROP;
     }
 
@@ -2217,7 +2222,14 @@ void Player::releasePipeline(PipelineCtx *ctx, bool synchronous, std::function<v
         gst_element_set_state(pipe, GST_STATE_NULL);
         GstBus *bus = gst_element_get_bus(pipe);
         gst_bus_set_sync_handler(bus, nullptr, nullptr, nullptr);
+        // Messages left in the bus queue hold a reference to their source,
+        // including the pipeline itself (state changes): bus -> message ->
+        // pipeline -> bus is a cycle, and the whole pipeline (network
+        // sessions, decoder buffers, threads) would never be freed.
+        gst_bus_set_flushing(bus, TRUE);
         gst_object_unref(bus);
+        if (qEnvironmentVariableIsSet("HMI_DEBUG_REFS"))
+            qInfo("release %s: refcount %d", GST_OBJECT_NAME(pipe), GST_OBJECT_REFCOUNT_VALUE(pipe));
         gst_object_unref(pipe);
         delete ctx;
         QMetaObject::invokeMethod(qApp, [self] { if (self) self->onTeardownDone(); }, Qt::QueuedConnection);
