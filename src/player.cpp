@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QJsonObject>
 #include <QQuickItem>
+#include <QRegularExpression>
 #include <QQuickWindow>
 #include <QRunnable>
 #include <QThread>
@@ -2538,16 +2539,21 @@ void Player::updateHealth()
 }
 
 // Short Russian explanation for the most common GStreamer errors.
+// msg = error message, then (after '\n') the debug details of GStreamer. The
+// message is matched as before; from the details only explicit HTTP/RTSP
+// status codes are taken (the details are long free text: a generic word
+// such as "not found" there must not decide the explanation).
 static QString explainError(const QString &msg)
 {
+    const QString message = msg.section(QLatin1Char('\n'), 0, 0);
+    const QString details = msg.section(QLatin1Char('\n'), 1);
     static const struct { const char *needle; const char *text; } map[] = {
-        {"Service Unavailable", "Сервер временно не отдаёт поток (503)"},
-        {"(503)", "Сервер временно не отдаёт поток (503)"},
         {"Unauthorized", "Ошибка авторизации: проверьте логин и пароль"},
-        {"(401)", "Ошибка авторизации: проверьте логин и пароль"},
-        {"(403)", "Доступ запрещён (403)"},
+        {"401", "Ошибка авторизации: проверьте логин и пароль"},
+        {"403", "Доступ запрещён (403)"},
         {"Not Found", "Поток не найден (404): проверьте адрес"},
-        {"(404)", "Поток не найден (404): проверьте адрес"},
+        {"404", "Поток не найден (404): проверьте адрес"},
+        {"Service Unavailable", "Сервер временно не отдаёт поток (503)"},
         {"Could not open resource", "Не удалось подключиться к источнику"},
         {"Could not resolve", "Не удалось найти сервер по имени"},
         {"Could not read from resource", "Ошибка чтения из источника"},
@@ -2555,10 +2561,33 @@ static QString explainError(const QString &msg)
         {"Could not connect", "Не удалось подключиться к источнику"},
         {"timeout", "Таймаут сети"},
     };
-    for (const auto &m : map)
-        if (msg.contains(QLatin1String(m.needle), Qt::CaseInsensitive))
-            return QString::fromUtf8(m.text);
-    return msg.section(QLatin1Char('\n'), 0, 0);    // without the debug details
+    QString text;
+    for (const auto &m : map) {
+        if (message.contains(QLatin1String(m.needle), Qt::CaseInsensitive)) {
+            text = QString::fromUtf8(m.text);
+            break;
+        }
+    }
+    // Status codes written by souphttpsrc / rtspsrc: "Not Found (404)", "Service Unavailable (503)".
+    static const QRegularExpression code(QStringLiteral("\\b(Unauthorized|Forbidden|Not Found|Service Unavailable) \\((\\d{3})\\)"));
+    const QRegularExpressionMatch m = code.match(details);
+    if (m.hasMatch()) {
+        const int c = m.captured(2).toInt();
+        text = c == 401 ? QStringLiteral("Ошибка авторизации (401): проверьте логин и пароль")
+             : c == 403 ? QStringLiteral("Доступ запрещён (403)")
+             : c == 404 ? QStringLiteral("Поток не найден (404): проверьте адрес")
+             : QStringLiteral("Сервер временно не отдаёт поток (503)");
+        static const QRegularExpression urlRe(QStringLiteral("URL: (\\S+?),? "));
+        const QRegularExpressionMatch u = urlRe.match(details + QLatin1Char(' '));
+        if (u.hasMatch())
+            text += QStringLiteral("\nЗапрошен: ") + QUrl(u.captured(1)).toString(QUrl::RemoveUserInfo | QUrl::RemoveQuery);
+    }
+    if (text.isEmpty())
+        return message;
+    // The original message helps when the explanation is not enough.
+    if (!text.contains(message))
+        text += QStringLiteral("\n(") + message + QLatin1Char(')');
+    return text;
 }
 
 void Player::onPipelineError(quint64 gen, const QString &msg)
@@ -2567,10 +2596,16 @@ void Player::onPipelineError(quint64 gen, const QString &msg)
     if (m_camai && (isActive(gen) || isPending(gen))
         && (msg.contains(QLatin1String("Not Found")) || msg.contains(QLatin1String("(404)"))))
         m_camai->refreshCatalog();
-    if (isPending(gen))
-        failPending(explainError(msg));
-    else if (isActive(gen))
-        scheduleRetry(explainError(msg));
+    PipelineCtx *ctx = isPending(gen) ? m_pending : isActive(gen) ? m_ctx : nullptr;
+    if (!ctx)
+        return;
+    QString text = explainError(msg);
+    qWarning("[%s] %s: %s", qPrintable(m_name),
+             qPrintable(QUrl(ctx->url).toString(QUrl::RemoveUserInfo)), qPrintable(QString(text).replace(QLatin1Char('\n'), QLatin1String(" | "))));
+    if (ctx == m_pending)
+        failPending(text);
+    else
+        scheduleRetry(text);
 }
 
 void Player::onDecoderSelected(quint64 gen, const QString &codec, const QString &decoder, bool hw)
