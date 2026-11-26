@@ -21,6 +21,8 @@ Dialog {
         waitBox.value = Math.round(App.streamWaitMs / 100)
         autoCheck.checked = App.autoQuality
         fpsBox.value = Math.round(App.minTileFps)
+        App.refreshAudioDevices()
+        audioBox.currentIndex = Math.max(0, audioBox.model.indexOf(App.audioDevice))
     }
 
     contentItem: ScrollView {
@@ -101,12 +103,46 @@ Dialog {
                 text: "Потоки с меньшей частотой выбираются, только если других нет. По умолчанию — 10 к/с "
                       + "(например, у CAMAI превью 360p идёт с 5 к/с, 480p — с 10 к/с)."
             }
+            Label {
+                text: "Звук"
+                font.bold: true
+                Layout.topMargin: Math.round(dlg.em * 0.5)
+            }
+            RowLayout {
+                spacing: Math.round(dlg.em * 0.5)
+                Layout.fillWidth: true
+                Label { text: "Устройство вывода" }
+                ComboBox {
+                    id: audioBox
+                    Layout.fillWidth: true
+                    model: ["Системное по умолчанию"].concat(App.audioDevices)
+                }
+                Button {
+                    text: "↻"
+                    onClicked: {
+                        const cur = audioBox.currentText
+                        App.refreshAudioDevices()
+                        audioBox.currentIndex = Math.max(0, audioBox.model.indexOf(cur))
+                    }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Обновить список устройств"
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: "#9ca3af"
+                font.pixelSize: Math.round(dlg.em * 0.8)
+                text: "Звук включается значком динамика на плеере (по умолчанию выключен, одновременно — только у одного плеера). "
+                      + "Если выбранное устройство пропадёт, звук пойдёт на системное."
+            }
             Button {
                 text: "По умолчанию"
                 onClicked: {
                     waitBox.value = 30
                     autoCheck.checked = true
                     fpsBox.value = 10
+                    audioBox.currentIndex = 0
                 }
             }
         }
@@ -120,5 +156,6 @@ Dialog {
         App.streamWaitMs = waitBox.value * 100
         App.autoQuality = autoCheck.checked
         App.minTileFps = fpsBox.value
+        App.audioDevice = audioBox.currentIndex > 0 ? audioBox.currentText : ""
     }
 }

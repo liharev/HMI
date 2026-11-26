@@ -2,6 +2,7 @@
 #include "diagnostics.h"
 #include "gstutils.h"
 #include "player.h"
+#include <gst/gst.h>
 #include "camai.h"
 #include "discovery.h"
 #include "streamprofile.h"
@@ -314,6 +315,7 @@ void AppController::load()
         Player::setWaitTimeout(settings.value(QLatin1String("streamWaitMs")).toInt(3000));
         Player::setAutoQuality(settings.value(QLatin1String("autoQuality")).toBool(true));
         Player::setMinFps(settings.value(QLatin1String("minTileFps")).toDouble(10));
+        Player::setAudioDevice(settings.value(QLatin1String("audioDevice")).toString());
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
         // Automatic decisions are only valid for the environment they were
@@ -751,6 +753,46 @@ void AppController::setMinTileFps(double fps)
     settingsUpdated();
 }
 
+QString AppController::audioDevice() const
+{
+    return Player::audioDevice();
+}
+
+void AppController::setAudioDevice(const QString &name)
+{
+    if (name == Player::audioDevice())
+        return;
+    Player::setAudioDevice(name);
+    Q_EMIT settingsChanged();
+    scheduleSave();
+    Player::reapplyAudio();
+}
+
+void AppController::refreshAudioDevices()
+{
+    QStringList names;
+    GstDeviceMonitor *mon = gst_device_monitor_new();
+    gst_device_monitor_add_filter(mon, "Audio/Sink", nullptr);
+    if (gst_device_monitor_start(mon)) {
+        GList *devs = gst_device_monitor_get_devices(mon);
+        for (GList *l = devs; l; l = l->next) {
+            gchar *n = gst_device_get_display_name(GST_DEVICE(l->data));
+            const QString name = QString::fromUtf8(n);
+            g_free(n);
+            if (!name.isEmpty() && !names.contains(name))
+                names << name;
+        }
+        g_list_free_full(devs, gst_object_unref);
+        gst_device_monitor_stop(mon);
+    }
+    gst_object_unref(mon);
+    names.sort();
+    if (names != m_audioDevices) {
+        m_audioDevices = names;
+        Q_EMIT audioDevicesChanged();
+    }
+}
+
 void AppController::settingsUpdated()
 {
     Q_EMIT settingsChanged();
@@ -812,7 +854,8 @@ void AppController::save()
                      {QStringLiteral("hwCapacity"), m_hwCapacity},
                      {QStringLiteral("settings"), QJsonObject{{QStringLiteral("streamWaitMs"), Player::waitTimeout()},
                                                               {QStringLiteral("autoQuality"), Player::autoQuality()},
-                                                              {QStringLiteral("minTileFps"), Player::minFps()}}},
+                                                              {QStringLiteral("minTileFps"), Player::minFps()},
+                                                              {QStringLiteral("audioDevice"), Player::audioDevice()}}},
                      {QStringLiteral("decoderEnv"), decoderEnvironment()}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);

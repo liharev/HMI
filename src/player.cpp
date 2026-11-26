@@ -39,6 +39,8 @@ bool g_glRendering = false;
 int g_waitMs = 3000;
 bool g_autoQuality = true;
 double g_minFps = 10;
+QString g_audioDevice;
+QPointer<Player> g_audioPlayer;     // the only player with sound on
 } // namespace
 
 void Player::setGlRendering(bool on) { g_glRendering = on; }
@@ -70,6 +72,14 @@ struct PipelineCtx
     GstElement *tail = nullptr;
     std::atomic<bool> linked{false};
     std::atomic<int> videoStream{-1};
+    // Sound: detected in the stream; played only when wanted (one player).
+    bool wantAudio = false;
+    QString audioDevice;               // display name of the output, "" = system default
+    std::atomic<bool> hasAudio{false};
+    std::atomic<int> audioStream{-1};
+    std::atomic<bool> audioLinked{false};
+    std::atomic<quint64> audioBuffers{0};
+    GstElement *audioBin = nullptr;    // owned by the pipeline
     std::atomic<quint64> frames{0};      // decoded (tail input)
     std::atomic<quint64> inFrames{0};    // compressed frames into the decoder
     std::atomic<quint64> inBytes{0};     // compressed bytes into the decoder
@@ -231,6 +241,18 @@ struct PipelineCallbacks
             GError *err = nullptr;
             gchar *dbg = nullptr;
             gst_message_parse_error(msg, &err, &dbg);
+            if (ctx->audioBin && gst_object_has_as_ancestor(GST_MESSAGE_SRC(msg), GST_OBJECT(ctx->audioBin))) {
+                // The sound failed (no output device, codec...): the video goes on.
+                const QString text = QString::fromUtf8(err ? err->message : "ошибка");
+                qWarning("[%s] audio error from %s: %s (%s)", qPrintable(ctx->name),
+                         GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), qPrintable(text), dbg ? dbg : "");
+                g_clear_error(&err);
+                g_free(dbg);
+                Player *p = ctx->player;
+                const quint64 g = ctx->gen;
+                ctx->post([p, g, text] { p->onAudioError(g, text); });
+                break;
+            }
             const QString text = QString::fromUtf8(err ? err->message : "unknown error");
             qWarning("[%s] error from %s: %s (%s)", qPrintable(ctx->name),
                      GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), qPrintable(text), dbg ? dbg : "");
@@ -275,6 +297,19 @@ struct PipelineCallbacks
         case GST_MESSAGE_WARNING: {
             GError *err = nullptr;
             gst_message_parse_warning(msg, &err, nullptr);
+            if (ctx->audioBin && gst_object_has_as_ancestor(GST_MESSAGE_SRC(msg), GST_OBJECT(ctx->audioBin))) {
+                // e.g. autoaudiosink found no device and plays into a fake sink.
+                const QString text = QStringLiteral("устройство вывода недоступно (%1)")
+                                         .arg(QString::fromUtf8(err ? err->message : ""));
+                Player *p = ctx->player;
+                const quint64 g = ctx->gen;
+                ctx->post([p, g, text] {
+                    if ((p->isActive(g) || p->isPending(g)) && p->m_audioOn) {
+                        p->m_audioNote = QStringLiteral("Звук не слышен: ") + text;
+                        Q_EMIT p->audioChanged();
+                    }
+                });
+            }
             qWarning("[%s] warning from %s: %s", qPrintable(ctx->name),
                      GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), err ? err->message : "");
             g_clear_error(&err);
@@ -497,8 +532,17 @@ struct PipelineCallbacks
         auto *ctx = static_cast<PipelineCtx *>(data);
         const GstStructure *s = caps ? gst_caps_get_structure(caps, 0) : nullptr;
         const gchar *media = s ? gst_structure_get_string(s, "media") : nullptr;
+        if (media && g_strcmp0(media, "audio") == 0) {
+            noteAudio(ctx);
+            if (!ctx->wantAudio)
+                return FALSE;  // nobody listens: the sound is not even requested
+            int first = -1;
+            if (ctx->audioStream.compare_exchange_strong(first, int(num)))
+                return TRUE;
+            return first == int(num);
+        }
         if (!media || g_strcmp0(media, "video") != 0)
-            return FALSE;      // skip audio / metadata streams entirely
+            return FALSE;      // skip metadata streams entirely
         int expected = -1;
         if (ctx->videoStream.compare_exchange_strong(expected, int(num)))
             return TRUE;
@@ -515,7 +559,14 @@ struct PipelineCallbacks
         const gchar *media = gst_structure_get_string(s, "media");
         const QString enc = QString::fromUtf8(gst_structure_get_string(s, "encoding-name"));
         const bool isVideo = media && g_strcmp0(media, "video") == 0;
+        const bool isAudio = media && g_strcmp0(media, "audio") == 0;
         gst_caps_unref(caps);
+        if (isAudio) {
+            noteAudio(ctx);
+            if (ctx->wantAudio)
+                linkAudio(ctx, pad);
+            return;
+        }
         if (!isVideo)
             return;
         bool expected = false;
@@ -527,6 +578,108 @@ struct PipelineCallbacks
             return;
         }
         linkDecodeChain(ctx, pad, codec, true);
+    }
+
+    static void noteAudio(PipelineCtx *ctx)
+    {
+        bool was = false;
+        if (ctx->hasAudio.compare_exchange_strong(was, true)) {
+            Player *p = ctx->player;
+            const quint64 g = ctx->gen;
+            ctx->post([p, g] { p->onAudioDetected(g); });
+        }
+    }
+
+    static GstElement *makeAudioSink(const QString &device)
+    {
+        // Developer aid / headless tests: HMI_AUDIO_SINK=fakesink
+        if (qEnvironmentVariableIsSet("HMI_AUDIO_SINK"))
+            return make(qgetenv("HMI_AUDIO_SINK").constData());
+        if (!device.isEmpty()) {
+            GstDeviceMonitor *mon = gst_device_monitor_new();
+            gst_device_monitor_add_filter(mon, "Audio/Sink", nullptr);
+            GstElement *sink = nullptr;
+            if (gst_device_monitor_start(mon)) {
+                GList *devs = gst_device_monitor_get_devices(mon);
+                for (GList *l = devs; l && !sink; l = l->next) {
+                    gchar *name = gst_device_get_display_name(GST_DEVICE(l->data));
+                    if (device == QString::fromUtf8(name))
+                        sink = gst_device_create_element(GST_DEVICE(l->data), nullptr);
+                    g_free(name);
+                }
+                g_list_free_full(devs, gst_object_unref);
+                gst_device_monitor_stop(mon);
+            }
+            gst_object_unref(mon);
+            if (sink)
+                return sink;
+            qWarning("Audio output \"%s\" not found: using the system default", qPrintable(device));
+        }
+        return make("autoaudiosink");
+    }
+
+    static void audioDecodedPad(GstElement *, GstPad *pad, gpointer data)
+    {
+        auto *conv = static_cast<GstElement *>(data);
+        GstCaps *caps = gst_pad_get_current_caps(pad);
+        if (!caps)
+            caps = gst_pad_query_caps(pad, nullptr);
+        const bool raw = caps && g_str_has_prefix(gst_structure_get_name(gst_caps_get_structure(caps, 0)), "audio/x-raw");
+        if (caps)
+            gst_caps_unref(caps);
+        if (!raw)
+            return;
+        GstPad *sink = gst_element_get_static_pad(conv, "sink");
+        if (!gst_pad_is_linked(sink))
+            gst_pad_link(pad, sink);
+        gst_object_unref(sink);
+    }
+
+    // RTP or parsed audio -> queue ! decodebin ! audioconvert ! audioresample ! output,
+    // in its own bin: errors there switch the sound off, not the video.
+    static bool linkAudio(PipelineCtx *ctx, GstPad *srcPad)
+    {
+        bool expected = false;
+        if (!ctx->audioLinked.compare_exchange_strong(expected, true))
+            return false;
+        GstElement *queue = make("queue");
+        GstElement *dec = make("decodebin");
+        GstElement *conv = make("audioconvert");
+        GstElement *res = make("audioresample");
+        GstElement *sink = makeAudioSink(ctx->audioDevice);
+        if (!queue || !dec || !conv || !res || !sink) {
+            for (GstElement *e : {queue, dec, conv, res, sink})
+                if (e)
+                    gst_object_unref(e);
+            Player *p = ctx->player;
+            const quint64 g = ctx->gen;
+            ctx->post([p, g] { p->onAudioError(g, QStringLiteral("нет элементов вывода звука (gstreamer1.0-pulseaudio/alsa)")); });
+            return false;
+        }
+        // Old sound is dropped instead of delaying the stream.
+        gsu::setArg(queue, "max-size-buffers", QStringLiteral("0"));
+        gsu::setArg(queue, "max-size-bytes", QStringLiteral("0"));
+        gsu::setArg(queue, "max-size-time", QStringLiteral("1000000000"));
+        gsu::setArg(queue, "leaky", QStringLiteral("downstream"));
+        GstElement *bin = gst_bin_new("audio");
+        gst_bin_add_many(GST_BIN(bin), queue, dec, conv, res, sink, nullptr);
+        gst_element_link(queue, dec);
+        gst_element_link_many(conv, res, sink, nullptr);
+        g_signal_connect(dec, "pad-added", G_CALLBACK(&PipelineCallbacks::audioDecodedPad), conv);
+        if (GstPad *sp = gst_element_get_static_pad(sink, "sink")) {
+            gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->audioBuffers, nullptr);
+            gst_object_unref(sp);
+        }
+        GstPad *qpad = gst_element_get_static_pad(queue, "sink");
+        gst_element_add_pad(bin, gst_ghost_pad_new("sink", qpad));
+        gst_object_unref(qpad);
+        ctx->audioBin = bin;
+        gst_bin_add(GST_BIN(ctx->pipeline), bin);
+        gst_element_sync_state_with_parent(bin);
+        GstPad *binSink = gst_element_get_static_pad(bin, "sink");
+        const bool ok = !GST_PAD_LINK_FAILED(gst_pad_link(srcPad, binSink));
+        gst_object_unref(binSink);
+        return ok;
     }
 
     // Streams we do not show (audio, metadata, extra video) go to a fakesink,
@@ -572,6 +725,12 @@ struct PipelineCallbacks
         else if (name == QLatin1String("image/jpeg"))
             codec = gsu::Codec::Jpeg;
         const bool video = codec != gsu::Codec::Unknown || name.startsWith(QLatin1String("video/"));
+        if (name.startsWith(QLatin1String("audio/"))) {
+            noteAudio(ctx);
+            if (!ctx->wantAudio || !linkAudio(ctx, pad))
+                linkFakeSink(ctx, pad);
+            return;
+        }
         bool expected = false;
         if (!video || !ctx->linked.compare_exchange_strong(expected, true)) {
             linkFakeSink(ctx, pad);
@@ -685,6 +844,8 @@ Player::Player(QObject *parent)
 
 Player::~Player()
 {
+    if (g_audioPlayer == this)
+        g_audioPlayer = nullptr;
     if (m_camai)
         m_camai->removeUser(this);
     m_retryTimer.stop();
@@ -1440,6 +1601,8 @@ PipelineCtx *Player::buildPipeline(const QString &urlText, bool pending, QString
                                                          : gsu::DecoderPref(m_decoder);
     ctx->username = m_username;
     ctx->password = m_password;
+    ctx->wantAudio = m_audioOn;
+    ctx->audioDevice = g_audioDevice;
 
     GstElement *pipe = gst_pipeline_new(nullptr);
     ctx->pipeline = pipe;
@@ -1616,16 +1779,16 @@ PipelineCtx *Player::buildPipeline(const QString &urlText, bool pending, QString
 // ---------------------------------------------------------------------------
 // Seamless stream switching
 // ---------------------------------------------------------------------------
-void Player::switchStream(const QString &url, const QString &reason)
+void Player::switchStream(const QString &url, const QString &reason, bool force)
 {
     const QString target = url.trimmed().isEmpty() ? m_url : url.trimmed();
     if (m_pending) {
-        if (m_pending->url == target)
+        if (m_pending->url == target && !force)
             return;                               // already being prepared
         releasePipeline(m_pending, false);        // only the last request counts
         m_pending = nullptr;
     }
-    if (target == m_streamUrl && m_ctx) {
+    if (target == m_streamUrl && m_ctx && !force) {
         Q_EMIT overlayChanged();
         return;
     }
@@ -1684,7 +1847,13 @@ void Player::activatePending()
     }
     m_ctx = ctx;
     m_pipeline = ctx->pipeline;
+    if (m_streamUrl != ctx->url)
+        m_streamHasAudio = false;
     m_streamUrl = ctx->url;
+    if (ctx->hasAudio && !m_streamHasAudio) {
+        m_streamHasAudio = true;
+        Q_EMIT audioChanged();
+    }
     if (m_activeSurf != ctx->surface) {
         m_activeSurf = ctx->surface;     // the tile shows the other surface now
         Q_EMIT surfaceIndexChanged();
@@ -2163,9 +2332,11 @@ void Player::onWatchdog()
     updateHealth();
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
-        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f path %s decoder %s | %s",
+        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f path %s decoder %s audio %s/%llu | %s",
               qPrintable(m_name), m_inFps, m_fps, m_uploadFps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge,
-              qPrintable(renderPath()), qPrintable(m_decoderName), qPrintable(QString(m_healthText).replace(QLatin1Char('\n'), QLatin1String(" / "))));
+              qPrintable(renderPath()), qPrintable(m_decoderName), m_audioOn ? "on" : "off",
+              (unsigned long long)m_ctx->audioBuffers.load(std::memory_order_relaxed),
+              qPrintable(QString(m_healthText).replace(QLatin1Char('\n'), QLatin1String(" / "))));
     checkOutputSpeed();
     if (!m_ctx)
         return;     // the pipeline was rebuilt
@@ -2536,6 +2707,7 @@ QString Player::chooseUrl(QString *why) const
     r.boxWidth = swap ? m_viewH : m_viewW;
     r.boxHeight = swap ? m_viewW : m_viewH;
     r.minFps = g_minFps;
+    r.needAudio = m_audioOn;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     for (auto it = m_failedUntil.cbegin(); it != m_failedUntil.cend(); ++it)
         if (it.value() > now)
@@ -2662,12 +2834,106 @@ void Player::setSourceNote(const QString &n)
     updateHealth();
 }
 
+// ---------------------------------------------------------------------------
+// Sound
+// ---------------------------------------------------------------------------
+void Player::setAudioDevice(const QString &name) { g_audioDevice = name; }
+QString Player::audioDevice() { return g_audioDevice; }
+
+void Player::reapplyAudio()
+{
+    if (g_audioPlayer && g_audioPlayer->m_audioOn)
+        g_audioPlayer->rebuildSeamless(QStringLiteral("устройство вывода звука изменено"));
+}
+
+bool Player::audioAvailable() const
+{
+    if (m_streamHasAudio)
+        return true;
+    for (const StreamProfile &sp : m_profiles)
+        if (sp.audio == 1)
+            return true;
+    return false;
+}
+
+void Player::setAudioEnabled(bool on)
+{
+    if (on == m_audioOn)
+        return;
+    if (on) {
+        // Only one player plays sound: the previous one is switched off.
+        if (g_audioPlayer && g_audioPlayer != this)
+            g_audioPlayer->setAudioEnabled(false);
+        g_audioPlayer = this;
+    } else if (g_audioPlayer == this) {
+        g_audioPlayer = nullptr;
+    }
+    m_audioOn = on;
+    m_audioNote.clear();
+    Q_EMIT audioChanged();
+    qInfo("[%s] sound %s", qPrintable(m_name), on ? "on" : "off");
+    if (!m_active)
+        return;
+    // A stream with sound may be another profile (CAMAI previews have none).
+    const QString target = m_profiles.isEmpty() ? m_streamUrl : chooseUrl();
+    if (!target.isEmpty() && target != m_streamUrl)
+        switchStream(target, on ? QStringLiteral("включён звук") : QStringLiteral("выключен звук"));
+    else
+        rebuildSeamless(on ? QStringLiteral("включён звук") : QStringLiteral("выключен звук"));
+}
+
+// Same stream, new pipeline (e.g. with / without the sound branch), without
+// a black frame.
+void Player::rebuildSeamless(const QString &reason)
+{
+    if (m_ctx && m_status == Playing && m_gotFrame) {
+        switchStream(m_streamUrl, reason, true);
+    } else {
+        m_retryTimer.stop();
+        teardown();
+        ensureRunning();
+    }
+}
+
+void Player::onAudioDetected(quint64 gen)
+{
+    if (isPending(gen))
+        return;                 // applied on activation (ctx->hasAudio)
+    if (!isActive(gen))
+        return;
+    const int i = profiles::indexOf(m_profiles, m_streamUrl);
+    if (i >= 0 && m_profiles[i].audio != 1) {
+        m_profiles[i].audio = 1;
+        Q_EMIT profilesChanged();
+        Q_EMIT persistentChanged();
+    }
+    if (!m_streamHasAudio) {
+        m_streamHasAudio = true;
+        Q_EMIT audioChanged();
+    }
+}
+
+void Player::onAudioError(quint64 gen, const QString &msg)
+{
+    if (!isActive(gen) && !isPending(gen))
+        return;
+    if (!m_audioOn)
+        return;
+    m_audioOn = false;
+    if (g_audioPlayer == this)
+        g_audioPlayer = nullptr;
+    m_audioNote = QStringLiteral("Звук недоступен: ") + msg;
+    Q_EMIT audioChanged();
+    rebuildSeamless(m_audioNote);
+}
+
 // Profiles entered without parameters are examined in the background (once
 // per session), so that the automatic choice can use them.
 void Player::probeUnknownProfiles()
 {
     for (const StreamProfile &sp : std::as_const(m_profiles)) {
-        if (sp.known() || m_probed.contains(sp.url))
+        // Unknown parameters, or unknown sound (CAMAI main streams).
+        if ((sp.known() && sp.audio >= 0) || m_probed.contains(sp.url))
             continue;
         m_probed.insert(sp.url);
         const QString url = sp.url;
@@ -2676,6 +2942,12 @@ void Player::probeUnknownProfiles()
             const int i = profiles::indexOf(m_profiles, url);
             if (i < 0)
                 return;
+            if (error.isEmpty() && r.audio >= 0 && m_profiles[i].audio != r.audio && m_profiles[i].known()) {
+                m_profiles[i].audio = r.audio;
+                Q_EMIT profilesChanged();
+                Q_EMIT audioChanged();
+                Q_EMIT persistentChanged();
+            }
             if (!error.isEmpty() || !r.known()) {
                 qInfo("[%s] stream %s: parameters unknown (%s)", qPrintable(m_name), qPrintable(url), qPrintable(error));
                 return;

@@ -609,6 +609,66 @@ Item {
         ToolTip.delay: 800
     }
 
+    // ---------------------------------------------------------------- sound
+    // Speaker in the bottom-right corner when the stream (or another stream of
+    // the camera) has sound: crossed out = off (default), waves = playing.
+    // Only one player plays sound; switching it on here switches it off elsewhere.
+    Rectangle {
+        id: speaker
+        visible: tile.player.audioAvailable && tile.width >= 110 && tile.height >= 70
+        width: 28; height: 28; radius: 14
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.rightMargin: 26          // the resize corner stays usable
+        anchors.bottomMargin: 4
+        color: speakerMouse.containsMouse ? "#cc1f2937" : "#99000000"
+        border.color: tile.player.audioOn ? tile.view.accent : "#66ffffff"
+        border.width: tile.player.audioOn ? 2 : 1
+        z: 20
+        Canvas {
+            id: speakerIcon
+            anchors.fill: parent
+            anchors.margins: 6
+            readonly property bool on: tile.player.audioOn
+            onOnChanged: requestPaint()
+            onPaint: {
+                const c = getContext("2d")
+                const w = width, h = height
+                c.clearRect(0, 0, w, h)
+                c.fillStyle = on ? "#ffffff" : "#d1d5db"
+                c.strokeStyle = c.fillStyle
+                c.lineWidth = 1.6
+                // speaker body
+                c.beginPath()
+                c.moveTo(0, h * 0.35); c.lineTo(w * 0.25, h * 0.35); c.lineTo(w * 0.52, h * 0.1)
+                c.lineTo(w * 0.52, h * 0.9); c.lineTo(w * 0.25, h * 0.65); c.lineTo(0, h * 0.65)
+                c.closePath(); c.fill()
+                c.beginPath()
+                if (on) {
+                    c.arc(w * 0.5, h * 0.5, w * 0.25, -0.8, 0.8)
+                    c.moveTo(w * 0.5 + w * 0.42 * Math.cos(-0.85), h * 0.5 + w * 0.42 * Math.sin(-0.85))
+                    c.arc(w * 0.5, h * 0.5, w * 0.42, -0.85, 0.85)
+                } else {
+                    c.strokeStyle = "#f87171"
+                    c.moveTo(w * 0.66, h * 0.3); c.lineTo(w * 0.98, h * 0.7)
+                    c.moveTo(w * 0.98, h * 0.3); c.lineTo(w * 0.66, h * 0.7)
+                }
+                c.stroke()
+            }
+        }
+        MouseArea {
+            id: speakerMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: tile.player.setAudioEnabled(!tile.player.audioOn)
+        }
+        ToolTip.visible: speakerMouse.containsMouse
+        ToolTip.delay: 400
+        ToolTip.text: (tile.player.audioOn ? "Выключить звук" : "Включить звук (у других плееров звук выключится)")
+                      + (tile.player.audioNote ? "\n" + tile.player.audioNote : "")
+    }
+
     // ---------------------------------------------------------------- menus
     Menu {
         id: contextMenu

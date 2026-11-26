@@ -45,6 +45,9 @@ class AppController : public QObject
     // lowest frame rate the choice may go to.
     Q_PROPERTY(bool autoQuality READ autoQuality WRITE setAutoQuality NOTIFY settingsChanged)
     Q_PROPERTY(double minTileFps READ minTileFps WRITE setMinTileFps NOTIFY settingsChanged)
+    // Output device for the sound ("" = system default) and the devices found.
+    Q_PROPERTY(QString audioDevice READ audioDevice WRITE setAudioDevice NOTIFY settingsChanged)
+    Q_PROPERTY(QStringList audioDevices READ audioDevices NOTIFY audioDevicesChanged)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -69,6 +72,10 @@ public:
     void setAutoQuality(bool on);
     double minTileFps() const;
     void setMinTileFps(double fps);
+    QString audioDevice() const;
+    void setAudioDevice(const QString &name);
+    QStringList audioDevices() const { return m_audioDevices; }
+    Q_INVOKABLE void refreshAudioDevices();
     // Reads resolution / frame rate / codec / audio of a stream (async);
     // the result comes with probeFinished(id, ...).
     Q_INVOKABLE int probeStream(const QString &url, const QString &user, const QString &password);
@@ -104,6 +111,7 @@ Q_SIGNALS:
     void glInfoChanged();
     void decoderBalanceChanged();
     void settingsChanged();
+    void audioDevicesChanged();
     void probeFinished(int id, const QVariantMap &profile, const QString &error);
     void camaiChannelsReady(int id, const QVariantList &channels, const QString &error);
     void discoverFinished(int id, const QVariantList &profiles, const QString &error);
@@ -144,6 +152,7 @@ private:
     QLocalServer *m_server = nullptr;
     bool m_quitting = false;
     int m_probeId = 0;
+    QStringList m_audioDevices;
     void settingsUpdated();
     // Window not visible (minimised, not shown by the compositor, display
     // switched off): its players stop after a delay.

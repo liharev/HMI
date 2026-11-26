@@ -424,6 +424,8 @@ void VmsWindow::attach(Player *p)
     connect(p, &Player::posChanged, this, &VmsWindow::scheduleVisibility);
     connect(p, &Player::zOrderChanged, this, &VmsWindow::scheduleVisibility);
     connect(p, &Player::spanChanged, this, &VmsWindow::scheduleRelayout);
+    // A player with sound keeps playing when hidden: re-check when it stops.
+    connect(p, &Player::audioChanged, this, &VmsWindow::scheduleVisibility);
     connect(p, &Player::persistentChanged, this, &VmsWindow::changed);
     // Keep the automatic sort up to date when a sort criterion changes.
     connect(p, &Player::configChanged, this, [this] { if (m_autoSort) applySort(); });

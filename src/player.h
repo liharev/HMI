@@ -119,6 +119,11 @@ class Player : public QObject
     Q_PROPERTY(int camaiChannel READ camaiChannel NOTIFY configChanged)
     // State of the source reported by the device (e.g. no signal on its input).
     Q_PROPERTY(QString sourceNote READ sourceNote NOTIFY sourceNoteChanged)
+    // Sound: available in the stream (or another stream of the camera),
+    // switched on (only one player at a time, off after a restart).
+    Q_PROPERTY(bool audioAvailable READ audioAvailable NOTIFY audioChanged)
+    Q_PROPERTY(bool audioOn READ audioOn NOTIFY audioChanged)
+    Q_PROPERTY(QString audioNote READ audioNote NOTIFY audioChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -254,7 +259,7 @@ public:
     // Seamless change of the played stream: the new stream is opened while
     // the current one keeps playing; the picture switches on its first frame.
     // Falls back to a plain restart (last frame kept) when nothing is shown.
-    Q_INVOKABLE void switchStream(const QString &url, const QString &reason = QString());
+    Q_INVOKABLE void switchStream(const QString &url, const QString &reason = QString(), bool force = false);
     QString streamUrl() const { return m_streamUrl; }
     bool overlayVisible() const;
     QString overlayText() const;
@@ -280,7 +285,17 @@ public:
     // hideDelayMs -> the stream stops; visible again -> it restarts at once.
     void setVisibility(bool visible, int hideDelayMs, const QString &reason);
     // A player that must keep playing when nobody sees it (e.g. its sound is on).
-    bool keepWhenHidden() const { return false; }
+    bool keepWhenHidden() const { return m_audioOn; }
+
+    bool audioAvailable() const;
+    bool audioOn() const { return m_audioOn; }
+    QString audioNote() const { return m_audioNote; }
+    Q_INVOKABLE void setAudioEnabled(bool on);
+    // Output device for the sound (display name, "" = system default).
+    static void setAudioDevice(const QString &name);
+    static QString audioDevice();
+    // Rebuilds the pipeline of the player that plays sound (device changed).
+    static void reapplyAudio();
 
     QString camaiService() const { return m_camaiService; }
     int camaiChannel() const { return m_camaiChannel; }
@@ -319,6 +334,7 @@ Q_SIGNALS:
     void spanChanged();
     void hiddenChanged();
     void sourceNoteChanged();
+    void audioChanged();
     void profileTextChanged();
     // The prepared stream could not be opened; the current one is kept.
     void switchFailed(const QString &url, const QString &reason);
@@ -357,6 +373,9 @@ private:
     void onCamaiCatalog();
     void onCamaiStatus();
     void setSourceNote(const QString &n);
+    void onAudioDetected(quint64 gen);
+    void onAudioError(quint64 gen, const QString &msg);
+    void rebuildSeamless(const QString &reason);
     void setStatus(Status s, const QString &text = QString());
     void setActive(bool a);
     void scheduleGlReady(int index);
@@ -473,6 +492,10 @@ private:
     QString m_camaiRtspHost;
     QPointer<CamaiService> m_camai;
     QString m_sourceNote;
+    // sound
+    bool m_audioOn = false;
+    bool m_streamHasAudio = false;      // the stream played now has a sound track
+    QString m_audioNote;
     QString m_lastError;        // shown while reconnecting
     QString m_stage;            // exchange status of the connecting stream
     QString m_pendingStage;     // ... of the prepared stream
