@@ -730,6 +730,11 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     }
     p->m_profilePin = o.value(QLatin1String("profilePin")).toString();
     p->m_z = o.value(QLatin1String("z")).toInt(0);
+    const QJsonArray span = o.value(QLatin1String("span")).toArray();
+    if (span.size() == 2) {
+        p->m_colSpan = qBound(1, span.at(0).toInt(1), 16);
+        p->m_rowSpan = qBound(1, span.at(1).toInt(1), 16);
+    }
     const QJsonObject camai = o.value(QLatin1String("camai")).toObject();
     p->m_camaiService = camai.value(QLatin1String("service")).toString();
     p->m_camaiChannel = camai.value(QLatin1String("channel")).toInt(-1);
@@ -780,6 +785,8 @@ QJsonObject Player::toJson() const
         o.insert(QLatin1String("profilePin"), m_profilePin);
     if (m_z)
         o.insert(QLatin1String("z"), m_z);
+    if (m_colSpan != 1 || m_rowSpan != 1)
+        o.insert(QLatin1String("span"), QJsonArray{m_colSpan, m_rowSpan});
     if (!m_camaiService.isEmpty())
         o.insert(QLatin1String("camai"), QJsonObject{{QStringLiteral("service"), m_camaiService},
                                                      {QStringLiteral("channel"), m_camaiChannel},
@@ -916,6 +923,18 @@ void Player::setLayoutRect(qreal x, qreal y, qreal w, qreal h)
     m_layoutW = w;
     m_layoutH = h;
     Q_EMIT layoutChanged();
+}
+
+void Player::setSpan(int cols, int rows)
+{
+    cols = qBound(1, cols, 16);
+    rows = qBound(1, rows, 16);
+    if (cols == m_colSpan && rows == m_rowSpan)
+        return;
+    m_colSpan = cols;
+    m_rowSpan = rows;
+    Q_EMIT spanChanged();
+    Q_EMIT persistentChanged();
 }
 
 void Player::setOrder(int o)

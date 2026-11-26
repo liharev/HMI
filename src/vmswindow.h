@@ -9,6 +9,8 @@
 #include <QPointer>
 #include <QRect>
 #include <QRectF>
+#include <QSize>
+#include <QVariantList>
 #include <QVariantMap>
 
 class Player;
@@ -63,6 +65,12 @@ class VmsWindow : public QObject
     Q_PROPERTY(int gridCols READ gridCols NOTIFY gridChanged)
     Q_PROPERTY(qreal cellWidth READ cellWidth NOTIFY contentSizeChanged)
     Q_PROPERTY(qreal cellHeight READ cellHeight NOTIFY contentSizeChanged)
+    // Grid actually used: the configured one, enlarged automatically when
+    // the players (with their spans) do not fit into it.
+    Q_PROPERTY(int effectiveRows READ effectiveRows NOTIFY contentSizeChanged)
+    Q_PROPERTY(int effectiveCols READ effectiveCols NOTIFY contentSizeChanged)
+    // Empty cells of the grid (QRectF list) for the "add camera" placeholders.
+    Q_PROPERTY(QVariantList freeCells READ freeCells NOTIFY contentSizeChanged)
     Q_PROPERTY(QString wallpaper READ wallpaper WRITE setWallpaper NOTIFY wallpaperChanged)
     Q_PROPERTY(qreal wallpaperDim READ wallpaperDim WRITE setWallpaperDim NOTIFY wallpaperChanged)
     Q_PROPERTY(qreal renderFps READ renderFps NOTIFY renderFpsChanged)
@@ -126,8 +134,15 @@ public:
     qreal cellHeight() const { return m_cellH; }
     // N rows x M columns of equal cells filling the window.
     Q_INVOKABLE void setGrid(int rows, int cols);
-    // Top-left of grid cell `index` (row-major), for empty-cell placeholders.
+    // Top-left of grid cell `index` (row-major).
     Q_INVOKABLE QPointF cellPos(int index) const;
+    int effectiveRows() const { return m_effRows; }
+    int effectiveCols() const { return m_effCols; }
+    QVariantList freeCells() const { return m_freeCells; }
+    // Size of a player in grid cells; the others are packed around it.
+    Q_INVOKABLE void setSpan(Player *p, int cols, int rows);
+    // Span for a tile of w x h pixels (snapped to whole cells).
+    Q_INVOKABLE QSize snapSpan(qreal w, qreal h) const;
 
     QString wallpaper() const { return m_wallpaper; }
     void setWallpaper(const QString &w);
@@ -226,4 +241,8 @@ private:
     int m_windowHiddenDelay = 0;
     QString m_windowHiddenReason;
     bool m_visibilityQueued = false;
+    int m_effRows = 2;
+    int m_effCols = 2;
+    QVariantList m_freeCells;
+    void layoutGrid();
 };

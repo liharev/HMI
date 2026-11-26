@@ -59,8 +59,12 @@ ApplicationWindow {
 
     function showDropIndicator(player, x, y) {
         const r = win.dropIndicator(player, x, y)
+        showRect(r)
+    }
+    // Grid: outline of the target place (drop) or of the snapped size (resize).
+    function showRect(r) {
         dropBar.x = r.x; dropBar.y = r.y; dropBar.width = r.width; dropBar.height = r.height
-        dropBar.visible = true
+        dropBar.visible = r.width > 0
     }
     function hideDropIndicator() { dropBar.visible = false }
 
@@ -161,7 +165,11 @@ ApplicationWindow {
             HeaderButton {
                 id: gridButton
                 fg: root.accentText
-                text: "Сетка " + root.win.gridRows + "×" + root.win.gridCols + " ▾"
+                // The grid grows by itself when the players do not fit: show both.
+                text: "Сетка " + root.win.gridRows + "×" + root.win.gridCols
+                      + (root.gridMode && (root.win.effectiveRows !== root.win.gridRows
+                                           || root.win.effectiveCols !== root.win.gridCols)
+                         ? " → " + root.win.effectiveRows + "×" + root.win.effectiveCols : "") + " ▾"
                 checked: root.gridMode
                 onClicked: gridPopup.open()
                 tip: "Все плееры одного размера в сетке N строк × M столбцов на всё окно"
@@ -425,17 +433,13 @@ ApplicationWindow {
 
             // Free cells of the grid: double click adds a camera.
             Repeater {
-                model: root.gridMode ? Math.max(0, root.win.gridRows * root.win.gridCols - root.win.playerCount) : 0
+                model: root.gridMode ? root.win.freeCells : []
                 delegate: Rectangle {
-                    required property int index
-                    readonly property point pos: {
-                        root.win.cellWidth; root.win.cellHeight; root.win.gridCols  // re-evaluate on change
-                        return root.win.cellPos(root.win.playerCount + index)
-                    }
-                    x: pos.x
-                    y: pos.y
-                    width: root.win.cellWidth
-                    height: root.win.cellHeight
+                    required property var modelData
+                    x: modelData.x
+                    y: modelData.y
+                    width: modelData.width
+                    height: modelData.height
                     color: "#0affffff"
                     border.color: "#22ffffff"
                     radius: 2
@@ -464,8 +468,11 @@ ApplicationWindow {
             Rectangle {
                 id: dropBar
                 visible: false
-                color: root.accent
-                radius: 2
+                // Flow: a bar between players; grid: the outlined target place.
+                color: root.gridMode ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18) : root.accent
+                border.color: root.accent
+                border.width: root.gridMode ? 3 : 0
+                radius: root.gridMode ? 4 : 2
                 z: 4000
             }
         }

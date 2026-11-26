@@ -1,4 +1,5 @@
 #include "vmswindow.h"
+#include <cmath>
 #include <QRegion>
 #include "player.h"
 
@@ -181,9 +182,128 @@ void VmsWindow::setGrid(int rows, int cols)
 
 QPointF VmsWindow::cellPos(int index) const
 {
-    const int r = index / m_gridCols;
-    const int col = index % m_gridCols;
+    const int r = index / m_effCols;
+    const int col = index % m_effCols;
     return QPointF(kMargin + col * (m_cellW + kSpacing), kMargin + r * (m_cellH + kSpacing));
+}
+
+void VmsWindow::setSpan(Player *p, int cols, int rows)
+{
+    if (!p)
+        return;
+    p->setSpan(cols, rows);
+    relayout();
+}
+
+QSize VmsWindow::snapSpan(qreal w, qreal h) const
+{
+    const int c = qBound(1, qRound((w + kSpacing) / (m_cellW + kSpacing)), qMax(1, m_effCols));
+    const int r = qBound(1, qRound((h + kSpacing) / (m_cellH + kSpacing)), qMax(1, m_effRows));
+    return QSize(c, r);
+}
+
+namespace {
+
+struct Placement { int row = 0, col = 0, rows = 1, cols = 1; };
+
+// Row-major first fit ("dense" packing): every player, in order, takes the
+// first free place large enough for it; smaller players fill the gaps next
+// to large ones. false if the grid is too small.
+bool pack(const QList<QSize> &spans, int cols, int rows, QList<Placement> *out)
+{
+    QList<QList<bool>> used(rows, QList<bool>(cols, false));
+    out->clear();
+    for (const QSize &sp : spans) {
+        const int cs = qMin(sp.width(), cols), rs = qMin(sp.height(), rows);
+        bool placed = false;
+        for (int r = 0; r + rs <= rows && !placed; ++r) {
+            for (int c = 0; c + cs <= cols && !placed; ++c) {
+                bool free = true;
+                for (int i = r; i < r + rs && free; ++i)
+                    for (int j = c; j < c + cs && free; ++j)
+                        free = !used[i][j];
+                if (!free)
+                    continue;
+                for (int i = r; i < r + rs; ++i)
+                    for (int j = c; j < c + cs; ++j)
+                        used[i][j] = true;
+                out->append({r, c, rs, cs});
+                placed = true;
+            }
+        }
+        if (!placed)
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
+// Grid: the configured N x M cells fill the window; when the players (with
+// their spans) do not fit, the grid grows by rows/columns - chosen so that
+// little space is wasted and the cells keep a video-like shape - and
+// everything stays visible without scrolling.
+void VmsWindow::layoutGrid()
+{
+    const QList<Player *> list = ordered();
+    QList<QSize> spans;
+    int area = 0, maxC = 1, maxR = 1;
+    for (Player *p : list) {
+        spans << QSize(p->colSpan(), p->rowSpan());
+        area += p->colSpan() * p->rowSpan();
+        maxC = qMax(maxC, p->colSpan());
+        maxR = qMax(maxR, p->rowSpan());
+    }
+    const qreal vw = qMax<qreal>(100, m_viewportW - 2 * kMargin);
+    const qreal vh = qMax<qreal>(80, m_viewportH - 2 * kMargin);
+    int rows = m_gridRows, cols = m_gridCols;
+    QList<Placement> places;
+    if (!pack(spans, cols, rows, &places)) {
+        double bestScore = 1e18;
+        QList<Placement> tmp;
+        for (int c = 1; c <= 16; ++c) {
+            for (int r = 1; r <= 16; ++r) {
+                if (c * r < area)
+                    continue;
+                // Spans larger than the grid are cut to it (packing allows it),
+                // but prefer grids that keep them.
+                const double cut = (c < maxC ? maxC - c : 0) + (r < maxR ? maxR - r : 0);
+                const double cellAspect = (vw / c) / (vh / r);
+                const double score = (c * r - area) + 4.0 * qAbs(std::log(cellAspect / (16.0 / 9.0))) + 10.0 * cut;
+                if (score >= bestScore || !pack(spans, c, r, &tmp))
+                    continue;
+                bestScore = score;
+                rows = r;
+                cols = c;
+                places = tmp;
+            }
+        }
+    }
+    const qreal cw = qMax<qreal>(20, (vw - (cols - 1) * kSpacing) / cols);
+    const qreal ch = qMax<qreal>(15, (vh - (rows - 1) * kSpacing) / rows);
+    m_cellW = cw;
+    m_cellH = ch;
+    m_effRows = rows;
+    m_effCols = cols;
+    QList<QList<bool>> used(rows, QList<bool>(cols, false));
+    for (int i = 0; i < list.size() && i < places.size(); ++i) {
+        const Placement &pl = places[i];
+        list[i]->setLayoutRect(kMargin + pl.col * (cw + kSpacing), kMargin + pl.row * (ch + kSpacing),
+                               pl.cols * cw + (pl.cols - 1) * kSpacing, pl.rows * ch + (pl.rows - 1) * kSpacing);
+        for (int r = pl.row; r < pl.row + pl.rows; ++r)
+            for (int c = pl.col; c < pl.col + pl.cols; ++c)
+                used[r][c] = true;
+    }
+    QVariantList freeCells;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c)
+            if (!used[r][c])
+                freeCells << QRectF(kMargin + c * (cw + kSpacing), kMargin + r * (ch + kSpacing), cw, ch);
+    m_freeCells = freeCells;
+    m_contentW = m_viewportW;
+    m_contentH = m_viewportH;
+    Q_EMIT contentSizeChanged();
+    scheduleVisibility();
 }
 
 void VmsWindow::setWallpaper(const QString &w)
@@ -303,6 +423,7 @@ void VmsWindow::attach(Player *p)
     connect(p, &Player::geometryChanged, this, &VmsWindow::scheduleVisibility);
     connect(p, &Player::posChanged, this, &VmsWindow::scheduleVisibility);
     connect(p, &Player::zOrderChanged, this, &VmsWindow::scheduleVisibility);
+    connect(p, &Player::spanChanged, this, &VmsWindow::scheduleRelayout);
     connect(p, &Player::persistentChanged, this, &VmsWindow::changed);
     // Keep the automatic sort up to date when a sort criterion changes.
     connect(p, &Player::configChanged, this, [this] { if (m_autoSort) applySort(); });
@@ -372,6 +493,17 @@ void VmsWindow::movePlayer(Player *p, int index)
 
 int VmsWindow::dropIndex(Player *dragged, qreal x, qreal y) const
 {
+    if (m_layoutMode == Grid) {
+        // The dragged player takes the place of the one under the cursor,
+        // the others shift (2 dropped on place 7: 1,3,4,5,6,7,2,8,9).
+        const QList<Player *> all = ordered();
+        for (int i = 0; i < all.size(); ++i) {
+            const Player *p = all[i];
+            if (QRectF(p->layoutX(), p->layoutY(), p->layoutWidth(), p->layoutHeight()).contains(x, y))
+                return i;
+        }
+        return all.size() - 1;      // empty cell: to the end
+    }
     QList<Player *> list = ordered();
     list.removeAll(dragged);
     if (list.isEmpty())
@@ -398,6 +530,20 @@ int VmsWindow::dropIndex(Player *dragged, qreal x, qreal y) const
 
 QRectF VmsWindow::dropIndicator(Player *dragged, qreal x, qreal y) const
 {
+    if (m_layoutMode == Grid) {
+        // Highlight of the target place.
+        for (Player *p : ordered()) {
+            const QRectF r(p->layoutX(), p->layoutY(), p->layoutWidth(), p->layoutHeight());
+            if (r.contains(x, y))
+                return r;
+        }
+        for (const QVariant &v : m_freeCells) {
+            const QRectF r = v.toRectF();
+            if (r.contains(x, y))
+                return r;
+        }
+        return QRectF();
+    }
     QList<Player *> list = ordered();
     list.removeAll(dragged);
     if (list.isEmpty())
@@ -648,22 +794,7 @@ void VmsWindow::relayout()
 {
     m_relayoutQueued = false;
     if (m_layoutMode == Grid) {
-        // Equal cells; N rows fill the viewport, further players continue
-        // on additional rows (scrolling).
-        const qreal cw = qMax<qreal>(40, (m_viewportW - 2 * kMargin - (m_gridCols - 1) * kSpacing) / m_gridCols);
-        const qreal ch = qMax<qreal>(30, (m_viewportH - 2 * kMargin - (m_gridRows - 1) * kSpacing) / m_gridRows);
-        m_cellW = cw;
-        m_cellH = ch;
-        const QList<Player *> list = ordered();
-        for (int i = 0; i < list.size(); ++i) {
-            const QPointF pos = cellPos(i);
-            list[i]->setLayoutRect(pos.x(), pos.y(), cw, ch);
-        }
-        const int rowsUsed = qMax(m_gridRows, int((list.size() + m_gridCols - 1) / m_gridCols));
-        m_contentW = m_viewportW;
-        m_contentH = 2 * kMargin + rowsUsed * ch + (rowsUsed - 1) * kSpacing;
-        Q_EMIT contentSizeChanged();
-        scheduleVisibility();
+        layoutGrid();
         return;
     }
     // Flow layout: left to right, wrap at the viewport edge. Always computed:

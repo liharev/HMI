@@ -18,6 +18,8 @@ Item {
     readonly property bool expanded: view && view.expandedTile === tile
     property bool dragging: false
     property bool resizing: false
+    property real resizeW: 0          // grid: live size while the corner is dragged
+    property real resizeH: 0
     property real dragX: 0
     property real dragY: 0
 
@@ -30,9 +32,9 @@ Item {
     y: expanded ? viewport.contentY + (viewport.height - expH) / 2
        : dragging ? dragY : (freeMode ? player.posY : player.layoutY)
     // Grid: every player takes a whole cell (video letterboxed inside).
-    width: expanded ? expW : (gridMode ? player.layoutWidth : player.displayWidth)
-    height: expanded ? expH : (gridMode ? player.layoutHeight : player.displayHeight)
-    z: expanded ? 6000 : (dragging ? 3000 : (freeMode ? player.zOrder : 0))
+    width: expanded ? expW : (gridMode ? (resizing ? resizeW : player.layoutWidth) : player.displayWidth)
+    height: expanded ? expH : (gridMode ? (resizing ? resizeH : player.layoutHeight) : player.displayHeight)
+    z: expanded ? 6000 : (dragging || resizing ? 3000 : (freeMode ? player.zOrder : 0))
 
     Behavior on x { enabled: !tile.freeMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
     Behavior on y { enabled: !tile.freeMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
@@ -422,14 +424,14 @@ Item {
             }
             tile.dragX = Math.max(0, p.x - offset.x)
             tile.dragY = Math.max(0, p.y - offset.y)
-            if (tile.flowMode)
+            if (tile.flowMode || tile.gridMode)
                 tile.view.showDropIndicator(tile.player, p.x, p.y)
         }
         onReleased: (m) => {
             if (!tile.dragging)
                 return
             const p = mapToItem(tile.parent, m.x, m.y)
-            if (tile.flowMode) {
+            if (tile.flowMode || tile.gridMode) {
                 tile.view.hideDropIndicator()
                 tile.win.movePlayer(tile.player, tile.win.dropIndex(tile.player, p.x, p.y))
             } else {
@@ -537,7 +539,7 @@ Item {
         width: 22; height: 22
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        visible: !tile.expanded && !tile.gridMode
+        visible: !tile.expanded
         cursorShape: Qt.SizeFDiagCursor
         preventStealing: true
         hoverEnabled: true
@@ -546,6 +548,8 @@ Item {
         onPressed: (m) => {
             startPos = mapToItem(tile.parent, m.x, m.y)
             startWidth = tile.player.displayWidth
+            tile.resizeW = tile.width
+            tile.resizeH = tile.height
             tile.resizing = true
             tile.bringToFront()
         }
@@ -553,14 +557,34 @@ Item {
             if (!pressed)
                 return
             const p = mapToItem(tile.parent, m.x, m.y)
+            if (tile.gridMode) {
+                // Any rectangle of whole cells: the outline shows the snapped size.
+                tile.resizeW = Math.max(tile.win.cellWidth * 0.5, tile.player.layoutWidth + p.x - startPos.x)
+                tile.resizeH = Math.max(tile.win.cellHeight * 0.5, tile.player.layoutHeight + p.y - startPos.y)
+                const sp = tile.win.snapSpan(tile.resizeW, tile.resizeH)
+                tile.view.showRect(Qt.rect(tile.x, tile.y,
+                                           sp.width * tile.win.cellWidth + (sp.width - 1) * 6,
+                                           sp.height * tile.win.cellHeight + (sp.height - 1) * 6))
+                return
+            }
             const dx = p.x - startPos.x
             const dy = (p.y - startPos.y) * tile.player.aspect
             // The dominant direction defines the new width; height follows
             // from the aspect ratio of the stream.
             tile.player.displayWidth = tile.clampWidth(startWidth + (Math.abs(dx) > Math.abs(dy) ? dx : dy))
         }
-        onReleased: tile.resizing = false
-        onCanceled: tile.resizing = false
+        onReleased: {
+            if (tile.gridMode) {
+                const sp = tile.win.snapSpan(tile.resizeW, tile.resizeH)
+                tile.view.hideDropIndicator()
+                tile.resizing = false
+                // The others are packed again around the new size.
+                tile.win.setSpan(tile.player, sp.width, sp.height)
+                return
+            }
+            tile.resizing = false
+        }
+        onCanceled: { tile.resizing = false; tile.view.hideDropIndicator() }
 
         Canvas {
             anchors.fill: parent
@@ -580,7 +604,8 @@ Item {
             }
         }
         ToolTip.visible: containsMouse && !pressed
-        ToolTip.text: "Изменить размер (пропорции сохраняются). Ctrl+колесо — масштаб"
+        ToolTip.text: tile.gridMode ? "Растянуть на несколько ячеек сетки (остальные плееры перестроятся)"
+                                    : "Изменить размер (пропорции сохраняются). Ctrl+колесо — масштаб"
         ToolTip.delay: 800
     }
 
@@ -628,6 +653,13 @@ Item {
         }
         MenuSeparator {}
         MenuItem { text: "Оригинальный размер"; enabled: !tile.gridMode; onTriggered: { tile.view.expandedTile = null; tile.player.resetSize() } }
+        MenuItem {
+            text: "Одна ячейка сетки (" + tile.player.colSpan + "×" + tile.player.rowSpan + " → 1×1)"
+            visible: tile.gridMode
+            height: visible ? implicitHeight : 0
+            enabled: tile.player.colSpan > 1 || tile.player.rowSpan > 1
+            onTriggered: tile.win.setSpan(tile.player, 1, 1)
+        }
         MenuItem { text: tile.expanded ? "Свернуть" : "Развернуть в окне"; onTriggered: tile.view.expandedTile = tile.expanded ? null : tile }
         MenuItem { text: "Увеличить (+25%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 1.25) }
         MenuItem { text: "Уменьшить (−20%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 0.8) }

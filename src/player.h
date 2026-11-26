@@ -64,6 +64,9 @@ class Player : public QObject
     Q_PROPERTY(qreal layoutWidth READ layoutWidth NOTIFY layoutChanged)
     Q_PROPERTY(qreal layoutHeight READ layoutHeight NOTIFY layoutChanged)
     Q_PROPERTY(int order READ order NOTIFY orderChanged)
+    // Size in grid cells (grid layout), persistent.
+    Q_PROPERTY(int colSpan READ colSpan NOTIFY spanChanged)
+    Q_PROPERTY(int rowSpan READ rowSpan NOTIFY spanChanged)
     // --- runtime state ---
     Q_PROPERTY(int status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusChanged)
@@ -200,6 +203,9 @@ public:
     void setLayoutRect(qreal x, qreal y, qreal w, qreal h);
     int order() const { return m_order; }
     void setOrder(int o);
+    int colSpan() const { return m_colSpan; }
+    int rowSpan() const { return m_rowSpan; }
+    void setSpan(int cols, int rows);
 
     int status() const { return m_status; }
     QString statusText() const { return m_statusText; }
@@ -310,6 +316,7 @@ Q_SIGNALS:
     void surfaceIndexChanged();
     void profilesChanged();
     void zOrderChanged();
+    void spanChanged();
     void hiddenChanged();
     void sourceNoteChanged();
     void profileTextChanged();
@@ -398,6 +405,8 @@ private:
     qreal m_layoutW = 0;
     qreal m_layoutH = 0;
     int m_order = 0;
+    int m_colSpan = 1;
+    int m_rowSpan = 1;
     int m_rotation = 0;
     bool m_flipH = false;
     bool m_flipV = false;
