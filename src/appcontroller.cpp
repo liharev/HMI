@@ -47,6 +47,9 @@ AppController::AppController(QQmlEngine *engine, bool glSink, const QString &con
         const qreal dt = qMax<qint64>(200, m_fpsClock.restart()) / 1000.0;   // real elapsed time
         for (auto it = m_frameCounters.begin(); it != m_frameCounters.end(); ++it)
             it.key()->setRenderFps(it.value()->exchange(0) / dt);
+        // Displays can be switched off without any event: poll them.
+        for (auto it = m_views.cbegin(); it != m_views.cend(); ++it)
+            updateWindowVisibility(it.key());
     });
     m_fpsTimer.start();
 
@@ -506,6 +509,105 @@ void AppController::trackView(VmsWindow *w, QQuickWindow *view)
     connect(view, &QWindow::heightChanged, w, update);
     connect(view, &QWindow::visibilityChanged, w, update);
     connect(view, &QWindow::screenChanged, w, update);
+    // Visibility for the players (expose events: the compositor stopped
+    // showing the window; display state is polled every second).
+    view->installEventFilter(this);
+    connect(view, &QWindow::visibilityChanged, w, [this, w] { updateWindowVisibility(w); });
+    connect(view, &QWindow::screenChanged, w, [this, w] { updateWindowVisibility(w); });
+}
+
+namespace {
+
+// State of the display a screen is shown on, from the DRM connector in
+// sysfs ("HDMI-A-1": status, dpms, enabled). X11 names outputs without the
+// "-A" ("HDMI-1"), both forms are matched.
+struct DisplayState
+{
+    bool found = false;
+    bool on = true;
+    QString detail;
+};
+
+DisplayState displayState(const QString &screenName)
+{
+    DisplayState st;
+    if (screenName.isEmpty())
+        return st;
+    static const QString root = qEnvironmentVariableIsSet("HMI_TEST_DRM_ROOT")
+                                    ? qEnvironmentVariable("HMI_TEST_DRM_ROOT")
+                                    : QStringLiteral("/sys/class/drm");
+    auto norm = [](QString n) { return n.toUpper().remove(QStringLiteral("-A-")).remove(QLatin1Char('-')); };
+    const QString want = norm(screenName);
+    const QDir dir(root);
+    for (const QString &entry : dir.entryList({QStringLiteral("card*-*")}, QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QString conn = entry.section(QLatin1Char('-'), 1);    // card1-HDMI-A-1 -> HDMI-A-1
+        if (conn != screenName && norm(conn) != want)
+            continue;
+        auto read = [&](const char *file) {
+            QFile f(dir.filePath(entry + QLatin1Char('/') + QLatin1String(file)));
+            return f.open(QIODevice::ReadOnly) ? QString::fromLatin1(f.readAll()).trimmed() : QString();
+        };
+        st.found = true;
+        const QString status = read("status");
+        const QString dpms = read("dpms");
+        const QString enabled = read("enabled");
+        if (status == QLatin1String("disconnected")) {
+            st.on = false;
+            st.detail = QStringLiteral("отключён от разъёма %1").arg(conn);
+        } else if (!dpms.isEmpty() && dpms != QLatin1String("On")) {
+            st.on = false;
+            st.detail = QStringLiteral("питание экрана выключено (%1, DPMS %2)").arg(conn, dpms);
+        } else if (enabled == QLatin1String("disabled")) {
+            st.on = false;
+            st.detail = QStringLiteral("вывод %1 отключён").arg(conn);
+        }
+        return st;
+    }
+    return st;
+}
+
+} // namespace
+
+bool AppController::eventFilter(QObject *obj, QEvent *ev)
+{
+    if (ev->type() == QEvent::Expose) {
+        for (auto it = m_views.cbegin(); it != m_views.cend(); ++it) {
+            if (it.value() == obj) {
+                VmsWindow *w = it.key();
+                QMetaObject::invokeMethod(this, [this, w] { if (m_views.contains(w)) updateWindowVisibility(w); },
+                                          Qt::QueuedConnection);
+                break;
+            }
+        }
+    }
+    return QObject::eventFilter(obj, ev);
+}
+
+void AppController::updateWindowVisibility(VmsWindow *w)
+{
+    QQuickWindow *v = m_views.value(w);
+    if (!v)
+        return;
+    QString reason;
+    int delay = 0;
+    const auto vis = v->visibility();
+    if (vis == QWindow::Minimized || vis == QWindow::Hidden) {
+        reason = QStringLiteral("окно свёрнуто");
+        delay = 2000;
+    } else if (!v->isExposed()) {
+        reason = QStringLiteral("окно не выводится на экран (закрыто другими окнами, на другом рабочем столе "
+                                "или экран погашен)");
+        delay = 5000;
+    } else if (QScreen *scr = v->screen()) {
+        // A display that is switched off keeps its place in the desktop
+        // (the window does not move): only the connector tells.
+        const DisplayState d = displayState(scr->name());
+        if (d.found && !d.on) {
+            reason = QStringLiteral("дисплей %1 выключен: %2").arg(scr->name(), d.detail);
+            delay = 5000;
+        }
+    }
+    w->setWindowHidden(!reason.isEmpty(), delay, reason);
 }
 
 void AppController::destroyView(VmsWindow *w)

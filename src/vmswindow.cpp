@@ -1,4 +1,5 @@
 #include "vmswindow.h"
+#include <QRegion>
 #include "player.h"
 
 #include <QCollator>
@@ -298,6 +299,10 @@ void VmsWindow::attach(Player *p)
     connect(p, &Player::geometryChanged, this, &VmsWindow::scheduleRelayout);
     connect(p, &Player::orderChanged, this, &VmsWindow::scheduleRelayout);
     connect(p, &Player::posChanged, this, &VmsWindow::scheduleRelayout);
+    connect(p, &Player::layoutChanged, this, &VmsWindow::scheduleVisibility);
+    connect(p, &Player::geometryChanged, this, &VmsWindow::scheduleVisibility);
+    connect(p, &Player::posChanged, this, &VmsWindow::scheduleVisibility);
+    connect(p, &Player::zOrderChanged, this, &VmsWindow::scheduleVisibility);
     connect(p, &Player::persistentChanged, this, &VmsWindow::changed);
     // Keep the automatic sort up to date when a sort criterion changes.
     connect(p, &Player::configChanged, this, [this] { if (m_autoSort) applySort(); });
@@ -511,6 +516,120 @@ void VmsWindow::stopAll()
         p->stop();
 }
 
+void VmsWindow::setViewportX(qreal x)
+{
+    if (qFuzzyCompare(x + 1, m_viewX + 1))
+        return;
+    m_viewX = x;
+    Q_EMIT viewportChanged();
+    scheduleVisibility();
+}
+
+void VmsWindow::setViewportY(qreal y)
+{
+    if (qFuzzyCompare(y + 1, m_viewY + 1))
+        return;
+    m_viewY = y;
+    Q_EMIT viewportChanged();
+    scheduleVisibility();
+}
+
+void VmsWindow::setExpandedPlayer(Player *p)
+{
+    if (p == m_expanded)
+        return;
+    m_expanded = p;
+    Q_EMIT expandedPlayerChanged();
+    scheduleVisibility();
+}
+
+void VmsWindow::raise(Player *p)
+{
+    if (!p)
+        return;
+    // Compact the stacking order to 1..n (the newest on top).
+    QList<Player *> list = m_players.items();
+    std::stable_sort(list.begin(), list.end(), [](Player *a, Player *b) { return a->zOrder() < b->zOrder(); });
+    list.removeAll(p);
+    list.append(p);
+    for (int i = 0; i < list.size(); ++i)
+        list[i]->setZOrder(i + 1);
+}
+
+void VmsWindow::setWindowHidden(bool hidden, int delayMs, const QString &reason)
+{
+    if (hidden == m_windowHidden && reason == m_windowHiddenReason)
+        return;
+    m_windowHidden = hidden;
+    m_windowHiddenDelay = delayMs;
+    m_windowHiddenReason = hidden ? reason : QString();
+    qInfo("Window \"%s\": %s", qPrintable(m_title),
+          hidden ? qPrintable(QStringLiteral("not visible (%1)").arg(reason)) : "visible");
+    Q_EMIT windowHiddenChanged();
+    updateVisibility();
+}
+
+void VmsWindow::scheduleVisibility()
+{
+    if (m_visibilityQueued)
+        return;
+    m_visibilityQueued = true;
+    QMetaObject::invokeMethod(this, [this] { updateVisibility(); }, Qt::QueuedConnection);
+}
+
+// Which players can be seen: inside the visible part of the canvas, not
+// covered completely by players above them (free layout), not behind an
+// expanded player, in a window that is on a working display.
+void VmsWindow::updateVisibility()
+{
+    m_visibilityQueued = false;
+    const QList<Player *> list = m_players.items();
+    if (m_windowHidden) {
+        for (Player *p : list)
+            p->setVisibility(false, m_windowHiddenDelay, m_windowHiddenReason);
+        return;
+    }
+    const QRect view = QRectF(m_viewX, m_viewY, m_viewportW, m_viewportH).toAlignedRect();
+    auto rectOf = [this](Player *p) {
+        if (m_layoutMode == Free)
+            return QRectF(p->posX(), p->posY(), p->displayWidth(), p->displayHeight());
+        return QRectF(p->layoutX(), p->layoutY(), p->layoutWidth(), p->layoutHeight());
+    };
+    constexpr int kDelay = 2000;
+    for (int i = 0; i < list.size(); ++i) {
+        Player *p = list[i];
+        if (m_expanded) {
+            if (p == m_expanded)
+                p->setVisibility(true, 0, QString());
+            else
+                p->setVisibility(false, kDelay, QStringLiteral("на всё окно развёрнут другой плеер"));
+            continue;
+        }
+        // Inner part (1 px border ignored): touching edges do not count.
+        const QRect r = rectOf(p).toAlignedRect().adjusted(1, 1, -1, -1);
+        QRegion visible = QRegion(r.intersected(view));
+        if (visible.isEmpty()) {
+            p->setVisibility(false, kDelay, QStringLiteral("за пределами видимой части окна"));
+            continue;
+        }
+        if (m_layoutMode == Free) {
+            for (int j = 0; j < list.size() && !visible.isEmpty(); ++j) {
+                Player *q = list[j];
+                if (q == p)
+                    continue;
+                // Above: higher z, or the same z and later in the list (drawn later).
+                if (q->zOrder() > p->zOrder() || (q->zOrder() == p->zOrder() && j > i))
+                    visible -= rectOf(q).toAlignedRect();
+            }
+            if (visible.isEmpty()) {
+                p->setVisibility(false, kDelay, QStringLiteral("полностью закрыт другими плеерами"));
+                continue;
+            }
+        }
+        p->setVisibility(true, 0, QString());
+    }
+}
+
 void VmsWindow::setSuspended(bool s, bool synchronous)
 {
     for (Player *p : m_players.items())
@@ -544,6 +663,7 @@ void VmsWindow::relayout()
         m_contentW = m_viewportW;
         m_contentH = 2 * kMargin + rowsUsed * ch + (rowsUsed - 1) * kSpacing;
         Q_EMIT contentSizeChanged();
+        scheduleVisibility();
         return;
     }
     // Flow layout: left to right, wrap at the viewport edge. Always computed:
@@ -577,4 +697,5 @@ void VmsWindow::relayout()
         m_contentH = ch;
         Q_EMIT contentSizeChanged();
     }
+    scheduleVisibility();
 }

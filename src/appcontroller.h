@@ -136,4 +136,8 @@ private:
     bool m_quitting = false;
     int m_probeId = 0;
     void settingsUpdated();
+    // Window not visible (minimised, not shown by the compositor, display
+    // switched off): its players stop after a delay.
+    void updateWindowVisibility(VmsWindow *w);
+    bool eventFilter(QObject *obj, QEvent *ev) override;
 };

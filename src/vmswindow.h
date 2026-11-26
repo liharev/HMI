@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
+#include <QPointer>
 #include <QRect>
 #include <QRectF>
 #include <QVariantMap>
@@ -65,6 +66,13 @@ class VmsWindow : public QObject
     Q_PROPERTY(QString wallpaper READ wallpaper WRITE setWallpaper NOTIFY wallpaperChanged)
     Q_PROPERTY(qreal wallpaperDim READ wallpaperDim WRITE setWallpaperDim NOTIFY wallpaperChanged)
     Q_PROPERTY(qreal renderFps READ renderFps NOTIFY renderFpsChanged)
+    // Scroll position of the canvas and the player expanded over the window
+    // (set by the window): used to find players nobody can see.
+    Q_PROPERTY(qreal viewportX READ viewportX WRITE setViewportX NOTIFY viewportChanged)
+    Q_PROPERTY(qreal viewportY READ viewportY WRITE setViewportY NOTIFY viewportChanged)
+    Q_PROPERTY(Player *expandedPlayer READ expandedPlayer WRITE setExpandedPlayer NOTIFY expandedPlayerChanged)
+    Q_PROPERTY(bool windowHidden READ windowHidden NOTIFY windowHiddenChanged)
+    Q_PROPERTY(QString windowHiddenReason READ windowHiddenReason NOTIFY windowHiddenChanged)
 
 public:
     enum LayoutMode { Flow = 0, Free = 1, Grid = 2 };
@@ -146,6 +154,20 @@ public:
 
     void setSuspended(bool s, bool synchronous = false);
 
+    qreal viewportX() const { return m_viewX; }
+    void setViewportX(qreal x);
+    qreal viewportY() const { return m_viewY; }
+    void setViewportY(qreal y);
+    Player *expandedPlayer() const { return m_expanded; }
+    void setExpandedPlayer(Player *p);
+    // Bring to the front in the free layout.
+    Q_INVOKABLE void raise(Player *p);
+    // The whole window cannot be seen (display off, not shown by the
+    // compositor...): every player stops after delayMs.
+    void setWindowHidden(bool hidden, int delayMs, const QString &reason);
+    bool windowHidden() const { return m_windowHidden; }
+    QString windowHiddenReason() const { return m_windowHiddenReason; }
+
 Q_SIGNALS:
     void titleChanged();
     void colorChanged();
@@ -159,6 +181,8 @@ Q_SIGNALS:
     void gridChanged();
     void wallpaperChanged();
     void renderFpsChanged();
+    void expandedPlayerChanged();
+    void windowHiddenChanged();
     void changed();          // anything persistent changed -> save
 
 private:
@@ -167,6 +191,8 @@ private:
     void scheduleRelayout();
     void applySort();
     void renumber(const QList<Player *> &list);
+    void scheduleVisibility();
+    void updateVisibility();
 
     QString m_uid;
     QString m_title;
@@ -193,4 +219,11 @@ private:
     qreal m_wallpaperDim = 0.0;
     qreal m_renderFps = -1;
     bool m_inSort = false;
+    qreal m_viewX = 0;
+    qreal m_viewY = 0;
+    QPointer<Player> m_expanded;
+    bool m_windowHidden = false;
+    int m_windowHiddenDelay = 0;
+    QString m_windowHiddenReason;
+    bool m_visibilityQueued = false;
 };

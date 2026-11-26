@@ -115,7 +115,7 @@ void Diagnostics::refresh()
 QVariantMap Diagnostics::streamsSection()
 {
     const QList<Player *> players = m_app->allPlayers();
-    int good = 0, warnN = 0, badN = 0, off = 0;
+    int good = 0, warnN = 0, badN = 0, off = 0, hidden = 0;
     qreal shown = 0, nominal = 0, bitrate = 0;
     QVariantList problems;
     bool display = false, decoder = false, source = false, noVideo = false;   // by health text
@@ -124,7 +124,12 @@ QVariantMap Diagnostics::streamsSection()
         case Player::HealthGood: ++good; break;
         case Player::HealthWarning: ++warnN; break;
         case Player::HealthBad: ++badN; break;
-        default: ++off; break;
+        default:
+            if (p->hidden())
+                ++hidden;
+            else
+                ++off;
+            break;
         }
         if (p->status() == Player::Playing) {
             shown += p->shownFps();
@@ -161,6 +166,7 @@ QVariantMap Diagnostics::streamsSection()
     segs << segment(good, QStringLiteral("#22c55e"), QStringLiteral("норма"))
          << segment(warnN, QStringLiteral("#eab308"), QStringLiteral("замечания"))
          << segment(badN, QStringLiteral("#ef4444"), QStringLiteral("проблемы"))
+         << segment(hidden, QStringLiteral("#475569"), QStringLiteral("не видны — потоки приостановлены"))
          << segment(off, QStringLiteral("#6b7280"), QStringLiteral("остановлены"));
 
     return {
@@ -169,7 +175,8 @@ QVariantMap Diagnostics::streamsSection()
         {QStringLiteral("icon"), QStringLiteral("▣")},
         {QStringLiteral("status"), players.isEmpty() ? 0 : st},
         {QStringLiteral("headline"), players.isEmpty() ? QStringLiteral("нет плееров")
-                                                       : QStringLiteral("%1 из %2 в норме").arg(good).arg(players.size())},
+                                     : QStringLiteral("%1 из %2 в норме").arg(good).arg(players.size() - hidden)
+                                           + (hidden ? QStringLiteral(", %1 не видны").arg(hidden) : QString())},
         {QStringLiteral("fraction"), nominal > 0 ? qMin<qreal>(1, shown / nominal) : -1},
         {QStringLiteral("gaugeText"), nominal > 0 ? pct(shown / nominal) : QString()},
         {QStringLiteral("gaugeLabel"), QStringLiteral("кадров показано")},

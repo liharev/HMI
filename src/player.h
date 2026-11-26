@@ -104,6 +104,12 @@ class Player : public QObject
     Q_PROPERTY(QString profilePin READ profilePin NOTIFY profilesChanged)
     // Current choice for the operator ("720p, авто: плеер 800×450 …").
     Q_PROPERTY(QString profileText READ profileText NOTIFY profileTextChanged)
+    // Stacking order in the free layout (persistent).
+    Q_PROPERTY(int zOrder READ zOrder WRITE setZOrder NOTIFY zOrderChanged)
+    // Nobody can see the player (covered, scrolled away, display off...):
+    // its stream is stopped until it becomes visible again.
+    Q_PROPERTY(bool hidden READ hidden NOTIFY hiddenChanged)
+    Q_PROPERTY(QString hiddenReason READ hiddenReason NOTIFY hiddenChanged)
 
 public:
     enum Status { Stopped, Connecting, Playing, Reconnecting, Suspended };
@@ -254,6 +260,16 @@ public:
     // profiles of that source, keeps the others.
     void setDiscoveredProfiles(const QString &source, const QList<StreamProfile> &list);
 
+    int zOrder() const { return m_z; }
+    void setZOrder(int z);
+    bool hidden() const { return m_hidden; }
+    QString hiddenReason() const { return m_hiddenReason; }
+    // Visibility of the player on the screen (VmsWindow). Invisible for
+    // hideDelayMs -> the stream stops; visible again -> it restarts at once.
+    void setVisibility(bool visible, int hideDelayMs, const QString &reason);
+    // A player that must keep playing when nobody sees it (e.g. its sound is on).
+    bool keepWhenHidden() const { return false; }
+
     // Video surface handling (called from QML).
     Q_INVOKABLE void attachGlItem(QQuickItem *item, int index = 0);
     Q_INVOKABLE void attachVideoSink(QVideoSink *sink, int index = 0);
@@ -283,6 +299,8 @@ Q_SIGNALS:
     void streamUrlChanged();
     void surfaceIndexChanged();
     void profilesChanged();
+    void zOrderChanged();
+    void hiddenChanged();
     void profileTextChanged();
     // The prepared stream could not be opened; the current one is kept.
     void switchFailed(const QString &url, const QString &reason);
@@ -419,6 +437,12 @@ private:
     QString m_downTarget;
     QHash<QString, qint64> m_failedUntil;   // URL -> ms epoch (switch failed)
     QSet<QString> m_probed;             // profiles whose parameters were requested
+    // visibility
+    int m_z = 0;
+    bool m_hidden = false;              // stream stopped because nobody sees the player
+    bool m_wantHidden = false;          // invisible, waiting for the delay
+    QString m_hiddenReason;
+    QTimer m_hideTimer;
     QString m_lastError;        // shown while reconnecting
     QString m_stage;            // exchange status of the connecting stream
     QString m_pendingStage;     // ... of the prepared stream

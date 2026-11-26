@@ -20,7 +20,6 @@ Item {
     property bool resizing: false
     property real dragX: 0
     property real dragY: 0
-    property int zOrder: 0
 
     // Size when expanded to the whole viewport (aspect preserved).
     readonly property real expW: viewport ? Math.min(viewport.width - 8, (viewport.height - 8) * player.aspect) : 0
@@ -33,7 +32,7 @@ Item {
     // Grid: every player takes a whole cell (video letterboxed inside).
     width: expanded ? expW : (gridMode ? player.layoutWidth : player.displayWidth)
     height: expanded ? expH : (gridMode ? player.layoutHeight : player.displayHeight)
-    z: expanded ? 6000 : (dragging ? 3000 : zOrder)
+    z: expanded ? 6000 : (dragging ? 3000 : (freeMode ? player.zOrder : 0))
 
     Behavior on x { enabled: !tile.freeMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
     Behavior on y { enabled: !tile.freeMode && !tile.dragging && !tile.resizing; NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
@@ -48,6 +47,7 @@ Item {
         }
     }
 
+    function bringToFront() { if (freeMode) win.raise(player) }
     function clampWidth(w) { return Math.max(160, Math.min(7680, w)) }
 
     // The control bar hides with a delay: HoverHandler briefly reports
@@ -200,7 +200,7 @@ Item {
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         onPressed: (m) => {
             if (!tile.expanded)
-                tile.zOrder = tile.view.nextZ()
+                tile.bringToFront()
             barTimer.restart()      // touch screens: show the controls on tap
         }
         onDoubleClicked: (m) => {
@@ -382,7 +382,7 @@ Item {
             const p = mapToItem(tile.parent, m.x, m.y)
             pressPos = p
             offset = Qt.point(p.x - tile.x, p.y - tile.y)
-            tile.zOrder = tile.view.nextZ()
+            tile.bringToFront()
             barTimer.restart()
         }
         onPositionChanged: (m) => {
@@ -521,7 +521,7 @@ Item {
             startPos = mapToItem(tile.parent, m.x, m.y)
             startWidth = tile.player.displayWidth
             tile.resizing = true
-            tile.zOrder = tile.view.nextZ()
+            tile.bringToFront()
         }
         onPositionChanged: (m) => {
             if (!pressed)
@@ -608,7 +608,7 @@ Item {
         MenuSeparator {}
         MenuItem { text: "Переместить в начало"; onTriggered: tile.win.movePlayer(tile.player, 0) }
         MenuItem { text: "Переместить в конец"; onTriggered: tile.win.movePlayer(tile.player, tile.win.playerCount) }
-        MenuItem { text: "На передний план"; enabled: !tile.flowMode; onTriggered: tile.zOrder = tile.view.nextZ() }
+        MenuItem { text: "На передний план"; enabled: !tile.flowMode; onTriggered: tile.bringToFront() }
         MenuSeparator {}
         MenuItem { text: "Настройки…"; onTriggered: tile.view.openPlayerSettings(tile.player) }
         MenuItem { text: "Удалить…"; onTriggered: removeDialog.open() }

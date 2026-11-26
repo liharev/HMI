@@ -19,8 +19,8 @@ ApplicationWindow {
     readonly property real em: fontMetrics.height
     FontMetrics { id: fontMetrics; font: root.font }
     property bool renderWarningClosed: false
-    property int zCounter: 1
     property var expandedTile: null
+    onExpandedTileChanged: win.expandedPlayer = expandedTile ? expandedTile.player : null
 
     title: win ? win.title : App.productName
     color: "#0e1013"
@@ -55,7 +55,6 @@ ApplicationWindow {
         App.closeWindow(win)
     }
 
-    function nextZ() { zCounter += 1; return zCounter }
     function openPlayerSettings(p) { playerDialog.openFor(p) }
 
     function showDropIndicator(player, x, y) {
@@ -401,6 +400,9 @@ ApplicationWindow {
 
         onWidthChanged: root.win.viewportWidth = width
         onHeightChanged: root.win.viewportHeight = height
+        // Players scrolled out of view stop their streams.
+        onContentXChanged: root.win.viewportX = contentX
+        onContentYChanged: root.win.viewportY = contentY
         Component.onCompleted: {
             root.win.viewportWidth = width
             root.win.viewportHeight = height

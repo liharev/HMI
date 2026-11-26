@@ -665,6 +665,15 @@ Player::Player(QObject *parent)
     connect(&m_downgradeTimer, &QTimer::timeout, this, [this] { evaluateProfile(true); });
     connect(this, &Player::orientationChanged, this, [this] { m_selectTimer.start(); });
     connect(this, &Player::streamUrlChanged, this, &Player::profilesChanged);   // "active" marks
+    m_hideTimer.setSingleShot(true);
+    connect(&m_hideTimer, &QTimer::timeout, this, [this] {
+        if (!m_wantHidden || m_hidden || keepWhenHidden())
+            return;
+        m_hidden = true;
+        Q_EMIT hiddenChanged();
+        qInfo("[%s] not visible (%s): stream paused", qPrintable(m_name), qPrintable(m_hiddenReason));
+        ensureRunning();
+    });
     connect(this, &Player::switchFailed, this, [this](const QString &url, const QString &) {
         // Do not ask for this stream again for a minute; try the next best.
         m_failedUntil.insert(url, QDateTime::currentMSecsSinceEpoch() + 60000);
@@ -717,6 +726,7 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
             p->m_profiles << sp;
     }
     p->m_profilePin = o.value(QLatin1String("profilePin")).toString();
+    p->m_z = o.value(QLatin1String("z")).toInt(0);
     const double a = o.value(QLatin1String("aspect")).toDouble(0);
     if (a > 0.1 && a < 10)
         p->m_savedAspect = a;   // keeps tile sizes stable before the stream starts
@@ -760,6 +770,8 @@ QJsonObject Player::toJson() const
     }
     if (!m_profilePin.isEmpty())
         o.insert(QLatin1String("profilePin"), m_profilePin);
+    if (m_z)
+        o.insert(QLatin1String("z"), m_z);
     return o;
 }
 
@@ -1074,7 +1086,7 @@ void Player::setSuspended(bool s, bool synchronous)
 
 bool Player::canRun() const
 {
-    return m_active && !m_suspended && m_surf[m_activeSurf].ready && !m_url.isEmpty();
+    return m_active && !m_suspended && !m_hidden && m_surf[m_activeSurf].ready && !m_url.isEmpty();
 }
 
 void Player::ensureRunning()
@@ -1087,6 +1099,13 @@ void Player::ensureRunning()
     if (m_suspended) {
         teardown();
         setStatus(Suspended);
+        return;
+    }
+    if (m_hidden) {
+        m_retryTimer.stop();
+        teardown();
+        endWait();
+        setStatus(Suspended, QStringLiteral("Не виден — поток приостановлен\n") + m_hiddenReason);
         return;
     }
     if (m_url.isEmpty()) {
@@ -2467,6 +2486,49 @@ QString Player::chooseUrl(QString *why) const
             r.excluded.insert(it.key());
     const int i = profiles::select(m_profiles, r, why);
     return i >= 0 ? m_profiles[i].url : m_url;
+}
+
+void Player::setZOrder(int z)
+{
+    if (z == m_z)
+        return;
+    m_z = z;
+    Q_EMIT zOrderChanged();
+    Q_EMIT persistentChanged();
+}
+
+void Player::setVisibility(bool visible, int hideDelayMs, const QString &reason)
+{
+    if (visible) {
+        m_hideTimer.stop();
+        m_wantHidden = false;
+        if (m_hidden) {
+            m_hidden = false;
+            Q_EMIT hiddenChanged();
+            qInfo("[%s] visible again: stream resumed", qPrintable(m_name));
+            if (m_status == Suspended && !m_suspended)
+                setStatus(Connecting);
+            ensureRunning();
+        }
+        return;
+    }
+    if (m_hiddenReason != reason) {
+        m_hiddenReason = reason;
+        if (m_hidden) {
+            Q_EMIT hiddenChanged();
+            ensureRunning();          // updates the status text
+        }
+    }
+    if (m_hidden)
+        return;
+    // Nothing is playing yet (e.g. at startup): do not start a stream that
+    // would be stopped again in a moment.
+    if (!m_ctx && !m_pending)
+        hideDelayMs = 0;
+    if (!m_wantHidden || (!m_hideTimer.isActive() || m_hideTimer.remainingTime() > hideDelayMs)) {
+        m_wantHidden = true;
+        m_hideTimer.start(qMax(0, hideDelayMs));
+    }
 }
 
 // Profiles entered without parameters are examined in the background (once
