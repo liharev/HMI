@@ -17,7 +17,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WORK="${WORK:-$HOME/panthor-debug}"
+# Under sudo $HOME is /root: use the home of the user who called sudo.
+USER_HOME="$HOME"
+if [ -n "${SUDO_USER:-}" ]; then
+  USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+WORK="${WORK:-$USER_HOME/panthor-debug}"
 KREL="$(uname -r)"
 EXPECTED="6.1.115-vendor-rk35xx"
 BRANCH="rk-6.1-rkr5.1"
@@ -53,7 +58,16 @@ cmd_build() {
   [ -d "/lib/modules/$KREL/build" ] || die "нет заголовков ядра: sudo apt install linux-headers-vendor-rk35xx"
   [ -f "$WORK/src/Kbuild" ] || cmd_fetch
   say "Сборка модулей для $KREL"
-  make -C "/lib/modules/$KREL/build" M="$WORK/src" -j"$(nproc)" modules
+  # The kernel was built with GCC 14: use the same major version if present
+  # (sudo apt install gcc-14), otherwise the default compiler.
+  local cc=()
+  if command -v gcc-14 >/dev/null; then
+    cc=(CC=gcc-14)
+    echo "Компилятор: gcc-14 (как у ядра)"
+  else
+    echo "gcc-14 не найден: используется $(gcc -dumpfullversion). Для точного совпадения: sudo apt install gcc-14"
+  fi
+  make -C "/lib/modules/$KREL/build" M="$WORK/src" "${cc[@]}" -j"$(nproc)" modules
   ls -la "$WORK/src"/*.ko
 }
 
