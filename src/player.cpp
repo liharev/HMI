@@ -46,6 +46,9 @@ QPointer<Player> g_audioPlayer;     // the only player with sound on
 
 void Player::setGlRendering(bool on) { g_glRendering = on; }
 bool Player::glRendering() { return g_glRendering; }
+static QString g_renderNote;
+void Player::setRenderNote(const QString &note) { g_renderNote = note; }
+QString Player::renderNote() { return g_renderNote; }
 void Player::setWaitTimeout(int ms) { g_waitMs = qBound(500, ms, 60000); }
 int Player::waitTimeout() { return g_waitMs; }
 void Player::setAutoQuality(bool on) { g_autoQuality = on; }

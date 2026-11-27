@@ -97,8 +97,11 @@ QVariantList AppController::screens() const
 
 QString AppController::renderBackend() const
 {
-    return m_glSink ? QStringLiteral("OpenGL ES (qml6glsink, zero-copy)")
-                    : QStringLiteral("Qt Multimedia (QVideoSink)");
+    QString s = m_glSink ? QStringLiteral("OpenGL ES (qml6glsink, zero-copy)")
+                         : QStringLiteral("Qt Multimedia (QVideoSink)");
+    if (!Player::renderNote().isEmpty())
+        s += QStringLiteral(". ") + Player::renderNote();
+    return s;
 }
 
 QString AppController::hardwareDecoders() const

@@ -145,6 +145,9 @@ public:
     static bool glRendering();
     // "Waiting for the video stream" (application setting): how long the last
     // frame is kept on the screen before the exchange status is shown.
+    // Why the GL output is not used (shown in "О программе" / diagnostics).
+    static void setRenderNote(const QString &note);
+    static QString renderNote();
     static void setWaitTimeout(int ms);
     static int waitTimeout();
     // Automatic stream choice by player size and the frame rate floor.

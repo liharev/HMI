@@ -7,6 +7,8 @@
 #include "vmswindow.h"
 
 #include <QCommandLineParser>
+#include <QSysInfo>
+#include <QFileInfo>
 #include <QFont>
 #include <QGuiApplication>
 #include <QLocalSocket>
@@ -117,6 +119,27 @@ int main(int argc, char *argv[])
     if (render == QLatin1String("auto") && qEnvironmentVariableIsSet("HMI_RENDER"))
         render = qEnvironmentVariable("HMI_RENDER").toLower();
     bool glSink = false;
+    // The Mali driver "panthor" backported to the Rockchip vendor kernel 6.1
+    // has a use-after-free in drm_gpuvm_prepare_objects() when GPU jobs are
+    // submitted from several GL contexts of one process (GStreamer's GL
+    // threads, one per video item): the kernel oopses and the whole system
+    // hangs. The Qt Multimedia output uses no GStreamer GL contexts. Forced
+    // GL output: --render gl / HMI_RENDER=gl.
+    if (render == QLatin1String("auto")) {
+        const QString kernel = QSysInfo::kernelVersion();
+        const QStringList v = kernel.section(QLatin1Char('-'), 0, 0).split(QLatin1Char('.'));
+        const int major = v.value(0).toInt(), minor = v.value(1).toInt();
+        const bool oldKernel = major < 6 || (major == 6 && minor < 12);
+        if (QFileInfo::exists(QStringLiteral("/sys/module/panthor"))
+            && (oldKernel || kernel.contains(QLatin1String("vendor")))) {
+            render = QStringLiteral("qt");
+            Player::setRenderNote(QStringLiteral("Вывод через GStreamer GL отключён: драйвер Mali panthor в ядре %1 "
+                                                 "приводит к сбою ядра (зависанию системы). Принудительно: --render gl")
+                                      .arg(kernel));
+            qWarning("panthor on kernel %s: GStreamer GL output disabled (kernel oops in drm_gpuvm); "
+                     "use --render gl to force it", qPrintable(kernel));
+        }
+    }
     if (render != QLatin1String("qt")) {
         // Creating the element loads the plugin, which registers the
         // GstGLQt6VideoItem QML type; must happen before QML is loaded.
