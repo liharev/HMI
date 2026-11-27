@@ -1507,7 +1507,12 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
         // Compatibility mode for unusual decoder output (e.g. 4:4:4, 12 bit).
         if (GstElement *vc = make("videoconvert")) {
             GstElement *f = make("capsfilter");
-            GstCaps *c = gst_caps_from_string("video/x-raw,format={NV12,I420,RGBA}");
+            // HMI_GL_COPY=2: always a CPU conversion into a new buffer (NV12
+            // from the decoder would pass through and the GPU would import
+            // the decoder's DMA buffer) - diagnostics of the panthor fault.
+            static const bool forceCopy = qEnvironmentVariableIntValue("HMI_GL_COPY") >= 2;
+            GstCaps *c = gst_caps_from_string(forceCopy ? "video/x-raw,format=I420"
+                                                        : "video/x-raw,format={NV12,I420,RGBA}");
             g_object_set(f, "caps", c, nullptr);
             gst_caps_unref(c);
             gsu::setArg(vc, "n-threads", QString::number(qMin(4, QThread::idealThreadCount())));
