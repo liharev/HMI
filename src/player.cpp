@@ -95,6 +95,10 @@ struct PipelineCtx
     bool pending = false;          // prepared stream: output blocked until activation
     GstElement *sink = nullptr;    // video sink (owned by the pipeline)
     int surface = 0;               // index of the tile surface drawn on
+    bool liveHttp = false;         // endless HTTP byte stream (MPEG-TS, MJPEG): cannot be paused
+    // Hidden player with a live HTTP source: 1 = drop everything before the
+    // decoder, 2 = drop until the next key frame (resuming), 0 = pass.
+    std::atomic<int> dropMode{0};
     int stallLimit = 10;           // seconds without frames before reconnect
     // Stream information of a pending pipeline, applied on activation (GUI thread).
     QString codec, decoder;
@@ -393,6 +397,23 @@ struct PipelineCallbacks
         return GST_PAD_PROBE_OK;
     }
 
+    // Decoder input while the player is hidden (live HTTP sources).
+    static GstPadProbeReturn dropProbe(GstPad *, GstPadProbeInfo *info, gpointer data)
+    {
+        auto *ctx = static_cast<PipelineCtx *>(data);
+        const int mode = ctx->dropMode.load(std::memory_order_relaxed);
+        if (mode == 0)
+            return GST_PAD_PROBE_OK;
+        if (mode == 2) {
+            GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info);
+            if (b && !GST_BUFFER_FLAG_IS_SET(b, GST_BUFFER_FLAG_DELTA_UNIT)) {
+                ctx->dropMode.store(0, std::memory_order_relaxed);   // key frame: decode again
+                return GST_PAD_PROBE_OK;
+            }
+        }
+        return GST_PAD_PROBE_DROP;
+    }
+
     // Frames reaching the video sink. A prepared stream becomes the shown
     // one as soon as its first frame is on its (hidden) surface.
     static GstPadProbeReturn shownProbe(GstPad *, GstPadProbeInfo *, gpointer data)
@@ -511,6 +532,7 @@ struct PipelineCallbacks
             // Frames received from the network (statistics / traffic light).
             gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::countProbe, &ctx->inFrames, nullptr);
             gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::bytesProbe, &ctx->inBytes, nullptr);
+            gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::dropProbe, ctx, nullptr);
             if ((isHw || qEnvironmentVariableIsSet("HMI_TEST_LIMIT_ALL")) && qEnvironmentVariableIsSet("HMI_TEST_HW_FPS"))
                 gst_pad_add_probe(dsink, GST_PAD_PROBE_TYPE_BUFFER, &PipelineCallbacks::hwLimitProbe, nullptr, nullptr);
             gst_object_unref(dsink);
@@ -1319,8 +1341,33 @@ void Player::ensureRunning()
     }
     if (m_hidden) {
         m_retryTimer.stop();
-        teardown();
         endWait();
+        if (m_pending) {
+            releasePipeline(m_pending, false);
+            m_pending = nullptr;
+            Q_EMIT overlayChanged();
+        }
+        // The pipeline is paused, not destroyed: no data from the network,
+        // the decoder and the GPU idle, the last frame stays on the tile.
+        // Destroying and rebuilding the GL output on every hide/show (tiles
+        // covered while dragging, windows not shown) hung the Mali GPU driver.
+        // A live HTTP byte stream cannot be paused (resuming it fails with
+        // "server does not support seeking"): it keeps flowing, but nothing
+        // reaches the decoder.
+        Source kind = Source::Other;
+        resolveUrl(m_streamUrl, &kind);
+        const bool dropping = m_ctx && m_ctx->liveHttp && m_ctx->hasDecoderProbe;
+        const bool pausable = m_ctx && (dropping || (kind != Source::Snapshot && kind != Source::MseLd));
+        if (pausable && !m_paused) {
+            m_watchdog.stop();
+            if (dropping)
+                m_ctx->dropMode.store(1);
+            else
+                gst_element_set_state(m_ctx->pipeline, GST_STATE_PAUSED);
+            m_paused = true;
+        } else if (!pausable) {
+            teardown();
+        }
         setStatus(Suspended, QStringLiteral("Не виден — поток приостановлен\n") + m_hiddenReason);
         return;
     }
@@ -1637,6 +1684,7 @@ PipelineCtx *Player::buildPipeline(const QString &urlText, bool pending, QString
         // HLS/DASH/MSS deliver whole segments at once: without clock sync a
         // segment would be shown in a burst followed by a freeze.
         ctx->forceSync = ctx->adaptive;
+        ctx->liveHttp = !ctx->adaptive;
     }
 
     QString err;
@@ -2163,6 +2211,7 @@ void Player::resetStats()
 
 void Player::teardown(bool synchronous)
 {
+    m_paused = false;
     m_watchdog.stop();
     stopNetworkSources();
     resetStats();
@@ -2796,6 +2845,25 @@ void Player::setVisibility(bool visible, int hideDelayMs, const QString &reason)
             m_hidden = false;
             Q_EMIT hiddenChanged();
             qInfo("[%s] visible again: stream resumed", qPrintable(m_name));
+            if (m_paused && m_ctx && !m_suspended && m_active) {
+                // Continue the paused pipeline; if the source does not come
+                // back, the stall watchdog reconnects as usual.
+                m_paused = false;
+                resetStats();
+                m_lastFrames = m_ctx->frames.load(std::memory_order_relaxed);
+                m_lastIn = m_ctx->hasDecoderProbe ? m_ctx->inFrames.load(std::memory_order_relaxed) : m_lastFrames;
+                m_lastBytes = m_ctx->inBytes.load(std::memory_order_relaxed);
+                m_stallTicks = 0;
+                m_connectTicks = 0;
+                if (m_ctx->dropMode.load() != 0)
+                    m_ctx->dropMode.store(2);    // decode again from the next key frame
+                else
+                    gst_element_set_state(m_ctx->pipeline, GST_STATE_PLAYING);
+                setStatus(m_gotFrame ? Playing : Connecting, m_gotFrame ? QString() : m_stage);
+                m_watchdog.start();
+                m_selectTimer.start();       // the size may have changed meanwhile
+                return;
+            }
             if (m_status == Suspended && !m_suspended)
                 setStatus(Connecting);
             ensureRunning();
@@ -3053,7 +3121,7 @@ void Player::evaluateProfile(bool allowDowngrade)
         setProfileText((m_profilePin.isEmpty() ? QStringLiteral("Авто: ") : QStringLiteral("Вручную: "))
                        + (tp.label.isEmpty() ? tp.describe() : tp.label + QStringLiteral(" (") + tp.describe() + QLatin1Char(')')));
     }
-    if (!m_active || m_suspended || target.isEmpty())
+    if (!m_active || m_suspended || m_hidden || target.isEmpty())
         return;
     if (target == m_streamUrl) {
         m_downgradeTimer.stop();

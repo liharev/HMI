@@ -484,6 +484,7 @@ private:
     int m_z = 0;
     bool m_hidden = false;              // stream stopped because nobody sees the player
     bool m_wantHidden = false;          // invisible, waiting for the delay
+    bool m_paused = false;              // hidden: pipeline kept in PAUSED (no teardown)
     QString m_hiddenReason;
     QTimer m_hideTimer;
     // CAMAI
