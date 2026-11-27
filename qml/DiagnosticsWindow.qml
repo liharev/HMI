@@ -219,7 +219,7 @@ ApplicationWindow {
                         // Title row
                         RowLayout {
                             Layout.fillWidth: true
-                            Label { text: card.modelData.icon; font.pixelSize: Math.round(dw.em * 1.0); opacity: 0.8 }
+                            Icon { name: card.modelData.icon; color: palette.windowText; opacity: 0.8; implicitWidth: Math.round(dw.em * 1.0); implicitHeight: implicitWidth }
                             Label {
                                 text: card.modelData.title
                                 font.bold: true
@@ -392,7 +392,7 @@ ApplicationWindow {
                                 wrapMode: Text.Wrap
                                 textFormat: Text.StyledText
                                 font.pixelSize: Math.max(10, Math.round(dw.em * 0.68))
-                                text: "• <b>" + modelData.k + "</b> — " + modelData.v
+                                text: "<b>" + modelData.k + "</b> — " + modelData.v
                             }
                             }
                         }
@@ -429,7 +429,7 @@ ApplicationWindow {
                                         width: adviceCol.width
                                         wrapMode: Text.Wrap
                                         font.pixelSize: Math.max(10, Math.round(dw.em * 0.68))
-                                        text: "→ " + modelData
+                                        text: "- " + modelData
                                     }
                                 }
                             }

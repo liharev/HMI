@@ -143,9 +143,10 @@ ApplicationWindow {
 
             HeaderButton {
                 fg: root.accentText
-                text: "＋ Камера"
-                onClicked: playerDialog.openFor(null)
-                tip: "Добавить плеер (Insert)"
+                text: "Добавить"
+                menu: true
+                onClicked: addMenu.popup(this, 0, height)
+                tip: "Добавить камеру, камеры устройства CAMAI или окно"
             }
             Rectangle { width: 1; height: 20; color: root.accentText; opacity: 0.35; Layout.leftMargin: 4; Layout.rightMargin: 4 }
             HeaderButton {
@@ -165,11 +166,8 @@ ApplicationWindow {
             HeaderButton {
                 id: gridButton
                 fg: root.accentText
-                // The grid grows by itself when the players do not fit: show both.
                 text: "Сетка " + root.win.gridRows + "×" + root.win.gridCols
-                      + (root.gridMode && (root.win.effectiveRows !== root.win.gridRows
-                                           || root.win.effectiveCols !== root.win.gridCols)
-                         ? " → " + root.win.effectiveRows + "×" + root.win.effectiveCols : "") + " ▾"
+                menu: true
                 checked: root.gridMode
                 onClicked: gridPopup.open()
                 tip: "Все плееры одного размера в сетке N строк × M столбцов на всё окно"
@@ -177,12 +175,14 @@ ApplicationWindow {
             Rectangle { width: 1; height: 20; color: root.accentText; opacity: 0.35; Layout.leftMargin: 4; Layout.rightMargin: 4 }
             HeaderButton {
                 fg: root.accentText
-                text: "Сортировка ▾"
+                text: "Сортировка"
+                menu: true
                 onClicked: sortMenu.popup(this, 0, height)
             }
             HeaderButton {
                 fg: root.accentText
-                text: "Окна ▾"
+                text: "Окна"
+                menu: true
                 onClicked: windowsMenu.popup(this, 0, height)
             }
             // Diagnostics with a traffic light (worst subsystem).
@@ -212,8 +212,8 @@ ApplicationWindow {
             }
             HeaderButton {
                 fg: root.accentText
-                text: "⋮"
-                font.pixelSize: 18
+                iconName: "more"
+                tip: "Меню программы"
                 onClicked: mainMenu.popup(this, 0, height)
             }
         }
@@ -274,19 +274,27 @@ ApplicationWindow {
                 opacity: 0.65
                 font.pixelSize: Math.round(root.em * 0.68)
                 text: "Плееры заполняют ячейки по порядку (порядок меняется перетаскиванием и сортировкой); "
-                      + "если плееров больше, чем ячеек, они продолжаются ниже с прокруткой."
+                      + "если плееров больше, чем ячеек, сетка увеличивается, чтобы поместились все."
             }
         }
     }
 
     Menu {
+        id: addMenu
+        width: root.em * 20
+        MenuItem { text: "Камеру…\tInsert"; onTriggered: playerDialog.openFor(null) }
+        MenuItem { text: "Камеры устройства CAMAI…"; onTriggered: playerDialog.openForCamai() }
+        MenuSeparator {}
+        MenuItem { text: "Окно\tCtrl+N"; onTriggered: App.newWindow() }
+    }
+    Menu {
         id: sortMenu
         width: root.em * 24
-        MenuItem { text: "По имени (А → Я)"; onTriggered: root.win.sortBy("name", true) }
-        MenuItem { text: "По имени (Я → А)"; onTriggered: root.win.sortBy("name", false) }
+        MenuItem { text: "По имени (от А до Я)"; onTriggered: root.win.sortBy("name", true) }
+        MenuItem { text: "По имени (от Я до А)"; onTriggered: root.win.sortBy("name", false) }
         MenuItem { text: "По адресу потока"; onTriggered: root.win.sortBy("url", true) }
-        MenuItem { text: "По размеру плеера (больше → меньше)"; onTriggered: root.win.sortBy("size", false) }
-        MenuItem { text: "По разрешению видео (больше → меньше)"; onTriggered: root.win.sortBy("resolution", false) }
+        MenuItem { text: "По размеру плеера (сначала большие)"; onTriggered: root.win.sortBy("size", false) }
+        MenuItem { text: "По разрешению видео (сначала большие)"; onTriggered: root.win.sortBy("resolution", false) }
         MenuItem { text: "По состоянию (проблемные первыми)"; onTriggered: root.win.sortBy("status", false) }
         MenuItem { text: "По времени добавления"; onTriggered: root.win.sortBy("created", true) }
         MenuSeparator {}
@@ -321,8 +329,10 @@ ApplicationWindow {
             model: App.windows
             delegate: MenuItem {
                 required property var modelData
-                text: (modelData === root.win ? "● " : (modelData.open ? "○ " : "    "))
-                      + modelData.title + (modelData.open ? "" : "  (закрыто)")
+                // The current window is marked by the standard check mark.
+                checkable: true
+                checked: modelData === root.win
+                text: modelData.title + (modelData.open ? "" : "  (закрыто)")
                 onTriggered: {
                     // The list is rebuilt when a window opens: act after the menu closed.
                     const w = modelData
@@ -443,11 +453,11 @@ ApplicationWindow {
                     color: "#0affffff"
                     border.color: "#22ffffff"
                     radius: 2
-                    Label {
+                    Icon {
                         anchors.centerIn: parent
-                        text: "＋"
+                        name: "plus"
                         opacity: 0.25
-                        font.pixelSize: Math.min(parent.width, parent.height) * 0.18
+                        width: Math.min(parent.width, parent.height) * 0.18; height: width
                     }
                     MouseArea {
                         anchors.fill: parent
@@ -505,8 +515,11 @@ ApplicationWindow {
             id: warnClose
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: "✕"
             onClicked: root.renderWarningClosed = true
+            contentItem: Item {
+                implicitWidth: 16; implicitHeight: 16
+                Icon { anchors.centerIn: parent; name: "close"; width: 14; height: 14; color: "white" }
+            }
         }
     }
 
@@ -575,7 +588,7 @@ ApplicationWindow {
             Label { text: App.renderBackend; wrapMode: Text.Wrap; Layout.fillWidth: true; Layout.preferredWidth: 1 }
             Label { text: "Графика (GPU):"; opacity: 0.7 }
             Label {
-                text: (App.glRenderer || "—") + (App.softwareRendering ? "  ⚠ без аппаратного ускорения" : "")
+                text: (App.glRenderer || "—") + (App.softwareRendering ? "  (без аппаратного ускорения)" : "")
                 color: App.softwareRendering ? "#fca5a5" : palette.windowText
                 wrapMode: Text.Wrap
                 Layout.fillWidth: true

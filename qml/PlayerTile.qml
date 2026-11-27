@@ -278,7 +278,7 @@ Item {
                 id: startBtn
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: statusPanel.showStart
-                text: "▶ Запустить"
+                text: "Запустить"
                 onClicked: tile.player.start()
             }
         }
@@ -292,17 +292,28 @@ Item {
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
         anchors.bottomMargin: tile.width >= 200 ? 26 : 4
-        width: Math.min(tile.width - 12, noteText.implicitWidth + 16)
+        width: Math.min(tile.width - 12, noteText.implicitWidth + noteIcon.width + 22)
         height: noteText.implicitHeight + 6
         radius: height / 2
         color: "#cc422006"
         border.color: "#f59e0b"
         z: 6
+        Icon {
+            id: noteIcon
+            name: "warning"
+            color: "#fde68a"
+            width: noteText.font.pixelSize + 2; height: width
+            anchors.left: parent.left
+            anchors.leftMargin: 8
+            anchors.verticalCenter: parent.verticalCenter
+        }
         Text {
             id: noteText
-            anchors.centerIn: parent
-            width: parent.width - 12
-            text: "⚠ " + tile.player.sourceNote
+            anchors.left: noteIcon.right
+            anchors.leftMargin: 4
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width - noteIcon.width - 18
+            text: tile.player.sourceNote
             color: "#fde68a"
             font.pixelSize: 11
             elide: Text.ElideRight
@@ -502,12 +513,12 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             spacing: 1
             ToolIconButton {
-                text: tile.player.active ? "■" : "▶"
+                iconName: tile.player.active ? "stop" : "play"
                 tip: tile.player.active ? "Остановить" : "Запустить"
                 onClicked: tile.player.active ? tile.player.stop() : tile.player.start()
             }
             ToolIconButton {
-                text: "↻"
+                iconName: "reload"
                 tip: "Переподключить"
                 onClicked: tile.player.restart()
             }
@@ -520,12 +531,12 @@ Item {
                 onClicked: { tile.view.expandedTile = null; tile.player.resetSize() }
             }
             ToolIconButton {
-                text: "⚙"
+                iconName: "gear"
                 tip: "Настройки плеера"
                 onClicked: tile.view.openPlayerSettings(tile.player)
             }
             ToolIconButton {
-                text: "✕"
+                iconName: "close"
                 tip: "Удалить плеер"
                 fg: "#fca5a5"
                 onClicked: removeDialog.open()
@@ -714,7 +725,7 @@ Item {
         MenuSeparator {}
         MenuItem { text: "Оригинальный размер"; enabled: !tile.gridMode; onTriggered: { tile.view.expandedTile = null; tile.player.resetSize() } }
         MenuItem {
-            text: "Одна ячейка сетки (" + tile.player.colSpan + "×" + tile.player.rowSpan + " → 1×1)"
+            text: "Одна ячейка сетки (сейчас " + tile.player.colSpan + "×" + tile.player.rowSpan + ")"
             visible: tile.gridMode
             height: visible ? implicitHeight : 0
             enabled: tile.player.colSpan > 1 || tile.player.rowSpan > 1
@@ -722,7 +733,7 @@ Item {
         }
         MenuItem { text: tile.expanded ? "Свернуть" : "Развернуть в окне"; onTriggered: tile.view.expandedTile = tile.expanded ? null : tile }
         MenuItem { text: "Увеличить (+25%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 1.25) }
-        MenuItem { text: "Уменьшить (−20%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 0.8) }
+        MenuItem { text: "Уменьшить (-20%)"; enabled: !tile.gridMode; onTriggered: tile.player.displayWidth = tile.clampWidth(tile.player.displayWidth * 0.8) }
         MenuSeparator {}
         MenuItem { text: "Переместить в начало"; onTriggered: tile.win.movePlayer(tile.player, 0) }
         MenuItem { text: "Переместить в конец"; onTriggered: tile.win.movePlayer(tile.player, tile.win.playerCount) }

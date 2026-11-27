@@ -37,6 +37,12 @@ Dialog {
     focus: true
     title: player ? "Настройки плеера" : "Новый плеер"
 
+    // "Добавить > Камеры устройства CAMAI": the dialog opens on that source.
+    function openForCamai() {
+        openFor(null)
+        modeBar.currentIndex = 1
+    }
+
     function openFor(p) {
         player = p
         const c = p ? p.config() : {}
@@ -306,8 +312,8 @@ Dialog {
     readonly property string protocol: {
         const u = url_.toLowerCase().split(/[?#]/)[0]
         if (/^rtsp/.test(u)) return "RTSP"
-        if (/^m4s/.test(u)) return "M4S → MSE-LD"
-        if (/^m4f/.test(u)) return "M4F → MPEG-TS"
+        if (/^m4s/.test(u)) return "M4S (как MSE-LD)"
+        if (/^m4f/.test(u)) return "M4F (как MPEG-TS)"
         if (/^wss?:/.test(u)) return "MSE-LD (WebSocket)"
         if (isSnapshot) return "JPEG-снимки"
         if (/\.m3u8$/.test(u)) return "HLS"
@@ -582,7 +588,7 @@ Dialog {
                         }
                     }
                     ToolButton {
-                        text: "✕"
+                        contentItem: Icon { name: "close"; color: palette.buttonText; implicitWidth: 14; implicitHeight: 14 }
                         onClicked: dlg.removeProfile(index)
                         ToolTip.visible: hovered
                         ToolTip.text: "Убрать поток из списка"

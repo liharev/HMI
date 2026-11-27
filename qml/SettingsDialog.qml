@@ -152,7 +152,7 @@ Dialog {
                     model: ["Системное по умолчанию"].concat(App.audioDevices)
                 }
                 Button {
-                    text: "↻"
+                    text: "Обновить"
                     onClicked: {
                         const cur = audioBox.currentText
                         App.refreshAudioDevices()

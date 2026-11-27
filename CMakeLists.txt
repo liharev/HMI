@@ -44,6 +44,7 @@ set(HMI_QML_FILES
     qml/ConfirmDialog.qml
     qml/DiagnosticsWindow.qml
     qml/SettingsDialog.qml
+    qml/Icon.qml
 )
 foreach(f IN LISTS HMI_QML_FILES)
     get_filename_component(n "${f}" NAME)

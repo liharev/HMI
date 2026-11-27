@@ -172,7 +172,7 @@ QVariantMap Diagnostics::streamsSection()
     return {
         {QStringLiteral("id"), QStringLiteral("streams")},
         {QStringLiteral("title"), QStringLiteral("Видеопотоки")},
-        {QStringLiteral("icon"), QStringLiteral("▣")},
+        {QStringLiteral("icon"), QStringLiteral("streams")},
         {QStringLiteral("status"), players.isEmpty() ? 0 : st},
         {QStringLiteral("headline"), players.isEmpty() ? QStringLiteral("нет плееров")
                                      : QStringLiteral("%1 из %2 в норме").arg(good).arg(players.size() - hidden)
@@ -257,7 +257,7 @@ QVariantMap Diagnostics::cpuSection()
     return {
         {QStringLiteral("id"), QStringLiteral("cpu")},
         {QStringLiteral("title"), QStringLiteral("Процессор")},
-        {QStringLiteral("icon"), QStringLiteral("⚙")},
+        {QStringLiteral("icon"), QStringLiteral("cpu")},
         {QStringLiteral("status"), st},
         {QStringLiteral("headline"), pct(total)},
         {QStringLiteral("fraction"), total},
@@ -299,7 +299,7 @@ QVariantMap Diagnostics::temperatureSection()
     return {
         {QStringLiteral("id"), QStringLiteral("temp")},
         {QStringLiteral("title"), QStringLiteral("Температура")},
-        {QStringLiteral("icon"), QStringLiteral("🌡")},
+        {QStringLiteral("icon"), QStringLiteral("temperature")},
         {QStringLiteral("status"), st},
         {QStringLiteral("headline"), maxT < 0 ? QStringLiteral("нет данных") : QStringLiteral("%1 °C").arg(maxT, 0, 'f', 0)},
         {QStringLiteral("fraction"), maxT < 0 ? -1 : maxT / 100.0},
@@ -391,7 +391,7 @@ QVariantMap Diagnostics::memorySection()
     return {
         {QStringLiteral("id"), QStringLiteral("memory")},
         {QStringLiteral("title"), QStringLiteral("Оперативная память")},
-        {QStringLiteral("icon"), QStringLiteral("▤")},
+        {QStringLiteral("icon"), QStringLiteral("memory")},
         {QStringLiteral("status"), st},
         {QStringLiteral("headline"), QStringLiteral("свободно %1").arg(gib(avail))},
         {QStringLiteral("fraction"), used},
@@ -492,7 +492,7 @@ QVariantMap Diagnostics::networkSection()
     return {
         {QStringLiteral("id"), QStringLiteral("network")},
         {QStringLiteral("title"), QStringLiteral("Сеть")},
-        {QStringLiteral("icon"), QStringLiteral("⇅")},
+        {QStringLiteral("icon"), QStringLiteral("network")},
         {QStringLiteral("status"), st},
         {QStringLiteral("headline"), mainIf.isEmpty() ? QStringLiteral("нет подключения") : mbps(qMax<qreal>(0, mainRx))},
         {QStringLiteral("fraction"), mainSpeed > 0 ? mainUtil : -1},
@@ -549,7 +549,7 @@ QVariantMap Diagnostics::decoderSection()
     }
     if (hasHw && !hasMpp && hw + sw > 4)
         advice << QStringLiteral("Используется декодер стандартного ядра (V4L2): его пропускная способность ограничена "
-                                 "(≈60 кадров 1080p/с). Максимум даёт vendor-ядро с MPP.");
+                                 "(около 60 кадров 1080p/с). Максимум даёт vendor-ядро с MPP.");
     if (lagging * 2 >= qMax(2, hw) && hw >= 2 && !m_app->balanceOff()) {
         st = worse(st, 1);
         advice << QStringLiteral("Аппаратный декодер не успевает: программа переносит часть потоков на процессор "
@@ -589,7 +589,7 @@ QVariantMap Diagnostics::decoderSection()
     return {
         {QStringLiteral("id"), QStringLiteral("decoder")},
         {QStringLiteral("title"), QStringLiteral("Видеодекодер")},
-        {QStringLiteral("icon"), QStringLiteral("▶")},
+        {QStringLiteral("icon"), QStringLiteral("decoder")},
         {QStringLiteral("status"), st},
         {QStringLiteral("headline"), hasMpp ? QStringLiteral("Rockchip MPP")
                                      : hasHw ? QStringLiteral("V4L2 (стандартное ядро)")
@@ -672,7 +672,7 @@ QVariantMap Diagnostics::gpuSection()
     return {
         {QStringLiteral("id"), QStringLiteral("gpu")},
         {QStringLiteral("title"), QStringLiteral("Графика")},
-        {QStringLiteral("icon"), QStringLiteral("◧")},
+        {QStringLiteral("icon"), QStringLiteral("gpu")},
         {QStringLiteral("status"), st},
         {QStringLiteral("headline"), headline},
         {QStringLiteral("fraction"), load},
@@ -713,7 +713,7 @@ QString Diagnostics::report() const
             out << QStringLiteral("    ! %1: %2").arg(p.toMap().value(QStringLiteral("k")).toString(),
                                                      p.toMap().value(QStringLiteral("v")).toString());
         for (const QVariant &a : m.value(QStringLiteral("advice")).toList())
-            out << QStringLiteral("    → %1").arg(a.toString());
+            out << QStringLiteral("    - %1").arg(a.toString());
         out << QString();
     }
     return out.join(QLatin1Char('\n'));

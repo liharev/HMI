@@ -224,7 +224,7 @@ void AppController::balanceDecoders()
     QString text = QStringLiteral("аппаратно: %1 (%2 Мпикс/с%3), программно: %4 (из них перенесено с аппаратного: %5); загрузка CPU %6%")
                              .arg(hw.size())
                              .arg(hwPx / 1e6, 0, 'f', 0)
-                             .arg(m_hwCapacity > 0 ? QStringLiteral(", предел ≈ %1").arg(m_hwCapacity / 1e6, 0, 'f', 0) : QString())
+                             .arg(m_hwCapacity > 0 ? QStringLiteral(", предел около %1").arg(m_hwCapacity / 1e6, 0, 'f', 0) : QString())
                              .arg(sw.size())
                              .arg(balanced)
                              .arg(qRound(cpu * 100));

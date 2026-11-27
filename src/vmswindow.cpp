@@ -159,6 +159,11 @@ void VmsWindow::setLayoutMode(int m)
             p->setPosY(p->layoutY());
         }
     }
+    if (m == Grid) {
+        // Entering the grid: every player takes one cell, all the same size.
+        for (Player *p : m_players.items())
+            p->setSpan(1, 1);
+    }
     m_layoutMode = m;
     Q_EMIT layoutModeChanged();
     Q_EMIT changed();
@@ -175,6 +180,9 @@ void VmsWindow::setGrid(int rows, int cols)
         Q_EMIT gridChanged();
         Q_EMIT changed();
     }
+    // Choosing a grid makes all players equal again (one cell each).
+    for (Player *p : m_players.items())
+        p->setSpan(1, 1);
     if (m_layoutMode != Grid)
         setLayoutMode(Grid);
     relayout();
@@ -285,6 +293,14 @@ void VmsWindow::layoutGrid()
     m_cellH = ch;
     m_effRows = rows;
     m_effCols = cols;
+    if (rows != m_gridRows || cols != m_gridCols) {
+        // The players did not fit: the grid really is larger now (shown on
+        // the grid button and kept), not a hidden "effective" size.
+        m_gridRows = rows;
+        m_gridCols = cols;
+        Q_EMIT gridChanged();
+        Q_EMIT changed();
+    }
     QList<QList<bool>> used(rows, QList<bool>(cols, false));
     for (int i = 0; i < list.size() && i < places.size(); ++i) {
         const Placement &pl = places[i];
