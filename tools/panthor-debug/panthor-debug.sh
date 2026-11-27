@@ -46,7 +46,9 @@ cmd_fetch() {
   curl -fsSL -o "$WORK/src/drm_gpuvm.c" "$RAW/drivers/gpu/drm/drm_gpuvm.c" || die "drm_gpuvm.c"
   curl -fsSL -o "$WORK/src/drm_exec.c" "$RAW/drivers/gpu/drm/drm_exec.c" || die "drm_exec.c"
   (cd "$WORK/src" && patch -p1 < "$HERE/debug.patch") || die "отладочная правка не применилась"
+  cp "$HERE/hmi_debug.h" "$WORK/src/"
   cat > "$WORK/src/Kbuild" <<'KB'
+ccflags-y += -include $(src)/hmi_debug.h
 obj-m := panthor.o drm_gpuvm.o drm_exec.o
 panthor-y := panthor/panthor_devfreq.o panthor/panthor_device.o panthor/panthor_drv.o \
 	panthor/panthor_fw.o panthor/panthor_gem.o panthor/panthor_gpu.o panthor/panthor_heap.o \
