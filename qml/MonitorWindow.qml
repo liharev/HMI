@@ -392,6 +392,11 @@ ApplicationWindow {
         source: root.win.wallpaper
         visible: root.win.wallpaper.length > 0 && status === Image.Ready
         fillMode: Image.PreserveAspectCrop
+        // Built-in wallpapers carry the logo in the lower right corner: keep it
+        // in view when the window is narrower or taller than the picture.
+        readonly property bool builtIn: root.win.wallpaper.startsWith("qrc:/wallpapers/")
+        horizontalAlignment: builtIn ? Image.AlignRight : Image.AlignHCenter
+        verticalAlignment: builtIn ? Image.AlignBottom : Image.AlignVCenter
         asynchronous: true
         // Decode once at screen size: no reload while the window is resized.
         sourceSize.width: root.screen ? root.screen.width : 1920
@@ -575,6 +580,18 @@ ApplicationWindow {
             columns: 2
             columnSpacing: 12
             rowSpacing: 6
+            Image {
+                Layout.columnSpan: 2
+                Layout.alignment: Qt.AlignHCenter
+                Layout.bottomMargin: 6
+                source: "qrc:/branding/logo-dark.png"
+                fillMode: Image.PreserveAspectFit
+                Layout.preferredWidth: Math.min(root.em * 20, aboutDialog.availableWidth)
+                Layout.preferredHeight: Layout.preferredWidth * 300 / 2010
+                sourceSize.width: 1005
+                smooth: true
+                mipmap: true
+            }
             Label {
                 Layout.columnSpan: 2
                 text: App.productName + " — рабочее место администратора видеонаблюдения"

@@ -9,7 +9,7 @@ import os
 import random
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter
 
 W, H = 1920, 1080
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "resources", "wallpapers")
@@ -17,7 +17,6 @@ TEAL = (20, 184, 166)
 CYAN = (34, 211, 238)
 BLUE = (59, 130, 246)
 VIOLET = (124, 58, 237)
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
 def gradient(c1, c2, angle=35):
@@ -55,17 +54,19 @@ def overlay(img, layer, blur=0):
     return img * (1 - alpha) + a[..., :3] * alpha
 
 
+LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "resources", "branding", "logo-dark.png")
+
+
 def wordmark(img):
+    """CAMAI VMS logo in the lower right corner, dimmed: visible, but quieter than any video."""
+    logo = Image.open(LOGO).convert("RGBA")
+    lw = 520
+    logo = logo.resize((lw, round(logo.height * lw / logo.width)), Image.LANCZOS)
+    a = np.asarray(logo).astype(np.float32)
+    a[..., 3] *= 0.22
+    logo = Image.fromarray(a.astype(np.uint8), "RGBA")
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    f = ImageFont.truetype(FONT, 46)
-    fs = ImageFont.truetype(FONT, 16)
-    text = "C A M A I"
-    tw = d.textlength(text, font=f)
-    x, y = W - tw - 64, H - 104
-    d.text((x, y), text, font=f, fill=(255, 255, 255, 20))
-    d.text((x + 2, y + 58), "VIDEO  MANAGEMENT  SYSTEM", font=fs, fill=(255, 255, 255, 16))
-    d.line((x, y + 50, x + tw, y + 50), fill=TEAL + (40,), width=2)
+    layer.alpha_composite(logo, (W - lw - 64, H - logo.height - 64))
     return overlay(img, layer)
 
 

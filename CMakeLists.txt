@@ -10,7 +10,7 @@ endif()
 option(HMI_CPU_TUNING "Tune code for the RK3588 CPU cores (Cortex-A76/A55) on aarch64" ON)
 option(HMI_LTO "Enable link-time optimisation" ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Network)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Multimedia Network Widgets)
 # Optional: Flussonic MSE-LD (fMP4 over WebSocket) playback.
 find_package(Qt6 6.4 QUIET OPTIONAL_COMPONENTS WebSockets)
 find_package(PkgConfig REQUIRED)
@@ -30,6 +30,7 @@ qt_add_executable(hmi-vms
     src/vmswindow.h src/vmswindow.cpp
     src/appcontroller.h src/appcontroller.cpp
     src/diagnostics.h src/diagnostics.cpp
+    src/branding.h src/branding.cpp
 )
 
 # QML sources live in qml/ but are placed at the module root (no extra
@@ -72,6 +73,44 @@ qt_add_resources(hmi-vms "wallpapers"
         resources/wallpapers/camai-graphite.jpg
 )
 
+# Application icons (window, tray, menu) for light and dark system themes,
+# CAMAI VMS logo.
+qt_add_resources(hmi-vms "branding"
+    PREFIX /branding
+    BASE resources/branding
+    FILES
+        resources/branding/app-dark-16.png
+        resources/branding/app-dark-22.png
+        resources/branding/app-dark-24.png
+        resources/branding/app-dark-32.png
+        resources/branding/app-dark-48.png
+        resources/branding/app-dark-64.png
+        resources/branding/app-dark-128.png
+        resources/branding/app-dark-256.png
+        resources/branding/app-dark-512.png
+        resources/branding/app-light-16.png
+        resources/branding/app-light-22.png
+        resources/branding/app-light-24.png
+        resources/branding/app-light-32.png
+        resources/branding/app-light-48.png
+        resources/branding/app-light-64.png
+        resources/branding/app-light-128.png
+        resources/branding/app-light-256.png
+        resources/branding/app-light-512.png
+        resources/branding/tray-dark-16.png
+        resources/branding/tray-dark-22.png
+        resources/branding/tray-dark-24.png
+        resources/branding/tray-dark-32.png
+        resources/branding/tray-light-16.png
+        resources/branding/tray-light-22.png
+        resources/branding/tray-light-24.png
+        resources/branding/tray-light-32.png
+        resources/branding/app-dark.svg
+        resources/branding/app-light.svg
+        resources/branding/logo-dark.png
+        resources/branding/logo-light.png
+)
+
 target_compile_definitions(hmi-vms PRIVATE
     HMI_VERSION="${PROJECT_VERSION}"
     QT_NO_KEYWORDS            # GStreamer/GLib headers use "signals"
@@ -79,7 +118,7 @@ target_compile_definitions(hmi-vms PRIVATE
 
 target_link_libraries(hmi-vms PRIVATE
     Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2
-    Qt6::Multimedia Qt6::Network
+    Qt6::Multimedia Qt6::Network Qt6::Widgets
     PkgConfig::GST)
 
 if(HMI_CPU_TUNING AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -109,3 +148,11 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS hmi-vms RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES packaging/hmi-vms.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+# Menu icon: the variant for light themes system-wide; while running, the
+# program puts the variant for the current theme into ~/.local/share/icons.
+foreach(s 16 22 24 32 48 64 128 256 512)
+    install(FILES resources/branding/app-light-${s}.png
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/${s}x${s}/apps RENAME hmi-vms.png)
+endforeach()
+install(FILES resources/branding/app-light.svg
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps RENAME hmi-vms.svg)

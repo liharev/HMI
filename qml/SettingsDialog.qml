@@ -25,6 +25,8 @@ Dialog {
         bufferBox.value = App.smoothBufferMs
         App.refreshAudioDevices()
         audioBox.currentIndex = Math.max(0, audioBox.model.indexOf(App.audioDevice))
+        iconBox.currentIndex = App.iconStyle
+        trayCheck.checked = App.trayIcon
     }
 
     contentItem: ScrollView {
@@ -170,6 +172,37 @@ Dialog {
                 text: "Звук включается значком динамика на плеере (по умолчанию выключен, одновременно — только у одного плеера). "
                       + "Если выбранное устройство пропадёт, звук пойдёт на системное."
             }
+            Label {
+                text: "Значки программы"
+                font.bold: true
+                Layout.topMargin: Math.round(dlg.em * 0.5)
+            }
+            RowLayout {
+                spacing: Math.round(dlg.em * 0.5)
+                Layout.fillWidth: true
+                Label { text: "Цвет" }
+                ComboBox {
+                    id: iconBox
+                    Layout.fillWidth: true
+                    model: ["По теме системы", "Тёмные (для светлой темы)", "Светлые (для тёмной темы)"]
+                }
+            }
+            CheckBox {
+                id: trayCheck
+                text: "Значок в области уведомлений (трее)"
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: "#9ca3af"
+                font.pixelSize: Math.round(dlg.em * 0.8)
+                text: App.themeInfo + " Значок окна, трея и меню приложений меняется вместе с темой. "
+                      + "Если панель задач тёмная при светлой теме, выберите светлые значки. "
+                      + (App.trayAvailable ? "Щелчок по значку в трее показывает окна программы, меню — список окон, "
+                                             + "новое окно, диагностику и выход."
+                                           : "Область уведомлений сейчас недоступна (в GNOME нужно расширение "
+                                             + "AppIndicator): значок появится, когда она будет.")
+            }
             Button {
                 text: "По умолчанию"
                 onClicked: {
@@ -179,6 +212,8 @@ Dialog {
                     audioBox.currentIndex = 0
                     smoothCheck.checked = true
                     bufferBox.value = 500
+                    iconBox.currentIndex = 0
+                    trayCheck.checked = true
                 }
             }
         }
@@ -195,5 +230,7 @@ Dialog {
         App.audioDevice = audioBox.currentIndex > 0 ? audioBox.currentText : ""
         App.smoothBufferMs = bufferBox.value
         App.smoothPlayback = smoothCheck.checked
+        App.iconStyle = iconBox.currentIndex
+        App.trayIcon = trayCheck.checked
     }
 }

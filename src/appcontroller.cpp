@@ -1,4 +1,5 @@
 #include "appcontroller.h"
+#include "branding.h"
 #include "diagnostics.h"
 #include "gstutils.h"
 #include "player.h"
@@ -27,6 +28,9 @@
 #include <QThreadPool>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
+#include <QAction>
+#include <QMenu>
+#include <QSystemTrayIcon>
 
 namespace {
 const char *const kPalette[] = {"#2563eb", "#16a34a", "#dc2626", "#d97706", "#7c3aed",
@@ -57,6 +61,13 @@ AppController::AppController(QQmlEngine *engine, bool glSink, const QString &con
     m_fpsTimer.start();
 
     m_diag = new Diagnostics(this);
+
+    m_branding = new Branding(this);
+    connect(m_branding, &Branding::changed, this, [this] {
+        if (m_tray)
+            m_tray->setIcon(m_branding->trayIcon());
+        Q_EMIT settingsChanged();
+    });
 
     m_balanceTimer.setInterval(3000);
     connect(&m_balanceTimer, &QTimer::timeout, this, &AppController::balanceDecoders);
@@ -321,6 +332,8 @@ void AppController::load()
         Player::setAudioDevice(settings.value(QLatin1String("audioDevice")).toString());
         Player::setSmoothDefault(settings.value(QLatin1String("smoothPlayback")).toBool(true));
         Player::setSmoothBufferMs(settings.value(QLatin1String("smoothBufferMs")).toInt(500));
+        m_branding->setStyle(settings.value(QLatin1String("iconStyle")).toInt(0));
+        m_trayEnabled = settings.value(QLatin1String("trayIcon")).toBool(true);
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
         // Automatic decisions are only valid for the environment they were
@@ -349,6 +362,7 @@ void AppController::load()
         });
         t->start(sec * 1000);
     }
+    updateTray();
     if (m_windows.isEmpty()) {
         newWindow();
         return;
@@ -896,7 +910,9 @@ void AppController::save()
                                                               {QStringLiteral("minTileFps"), Player::minFps()},
                                                               {QStringLiteral("audioDevice"), Player::audioDevice()},
                                                               {QStringLiteral("smoothPlayback"), Player::smoothDefault()},
-                                                              {QStringLiteral("smoothBufferMs"), Player::smoothBufferMs()}}},
+                                                              {QStringLiteral("smoothBufferMs"), Player::smoothBufferMs()},
+                                                              {QStringLiteral("iconStyle"), m_branding->style()},
+                                                              {QStringLiteral("trayIcon"), m_trayEnabled}}},
                      {QStringLiteral("decoderEnv"), decoderEnvironment()}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);
@@ -928,6 +944,10 @@ void AppController::shutdown()
         return;
     m_quitting = true;
     save();
+    delete m_tray;
+    m_tray = nullptr;
+    delete m_trayMenu;
+    m_trayMenu = nullptr;
     // Stop all pipelines in parallel, then wait for them before the GL
     // contexts and the QML engine go away.
     for (VmsWindow *w : m_windows)
@@ -941,4 +961,121 @@ void AppController::shutdown()
         }
     }
     m_views.clear();
+}
+
+// ------------------------------------------------------------------ icons, tray
+
+int AppController::iconStyle() const
+{
+    return m_branding->style();
+}
+
+void AppController::setIconStyle(int style)
+{
+    if (style == m_branding->style())
+        return;
+    m_branding->setStyle(style);
+    Q_EMIT settingsChanged();
+    scheduleSave();
+}
+
+void AppController::setTrayIcon(bool on)
+{
+    if (on == m_trayEnabled)
+        return;
+    m_trayEnabled = on;
+    updateTray();
+    Q_EMIT settingsChanged();
+    scheduleSave();
+}
+
+bool AppController::trayAvailable() const
+{
+    return QSystemTrayIcon::isSystemTrayAvailable();
+}
+
+QString AppController::themeInfo() const
+{
+    QString t = m_branding->themeKnown()
+        ? (m_branding->systemDark() ? QStringLiteral("тёмная") : QStringLiteral("светлая"))
+              + QStringLiteral(" (") + m_branding->themeSource() + QLatin1Char(')')
+        : QStringLiteral("не определена, считается светлой");
+    return QStringLiteral("Тема системы: ") + t + QStringLiteral(". Сейчас значки ")
+           + (m_branding->darkVariant() ? QStringLiteral("светлые (для тёмного фона).")
+                                        : QStringLiteral("тёмные (для светлого фона)."));
+}
+
+void AppController::showAllWindows()
+{
+    bool any = false;
+    for (auto it = m_views.cbegin(); it != m_views.cend(); ++it) {
+        QQuickWindow *v = it.value();
+        if (!v)
+            continue;
+        if (v->visibility() == QWindow::Minimized || v->visibility() == QWindow::Hidden)
+            v->showNormal();
+        v->raise();
+        v->requestActivate();
+        any = true;
+    }
+    if (!any && !m_windows.isEmpty())
+        openWindow(m_windows.first());
+}
+
+// Tray icon: shows the windows on a click; the menu opens windows, adds a
+// new one, shows the diagnostics and quits. Needs a system tray (most panels;
+// GNOME only with the AppIndicator extension).
+void AppController::updateTray()
+{
+    const bool available = QSystemTrayIcon::isSystemTrayAvailable();
+    if (!m_trayEnabled || m_quitting || !available) {
+        delete m_tray;
+        m_tray = nullptr;
+        // The panel may start after the program (autostart): look again.
+        if (m_trayEnabled && !m_quitting && !available && !m_trayRetry) {
+            m_trayRetry = true;
+            QTimer::singleShot(10000, this, [this] {
+                m_trayRetry = false;
+                if (QSystemTrayIcon::isSystemTrayAvailable())
+                    Q_EMIT settingsChanged();
+                updateTray();
+            });
+        }
+        return;
+    }
+    if (m_tray)
+        return;
+    if (!m_trayMenu) {
+        m_trayMenu = new QMenu;
+        connect(m_trayMenu, &QMenu::aboutToShow, this, &AppController::fillTrayMenu);
+        fillTrayMenu();
+    }
+    m_tray = new QSystemTrayIcon(m_branding->trayIcon(), this);
+    m_tray->setToolTip(productName());
+    m_tray->setContextMenu(m_trayMenu);
+    connect(m_tray, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason r) {
+        if (r == QSystemTrayIcon::Trigger || r == QSystemTrayIcon::DoubleClick)
+            showAllWindows();
+    });
+    m_tray->show();
+}
+
+void AppController::fillTrayMenu()
+{
+    m_trayMenu->clear();
+    m_trayMenu->addAction(QStringLiteral("Показать окна"), this, &AppController::showAllWindows);
+    m_trayMenu->addSeparator();
+    for (VmsWindow *w : std::as_const(m_windows)) {
+        QAction *a = m_trayMenu->addAction(w->title() + (m_views.value(w) ? QString() : QStringLiteral("  (закрыто)")));
+        QPointer<VmsWindow> pw(w);
+        connect(a, &QAction::triggered, this, [this, pw] {
+            if (pw)
+                openWindow(pw);
+        });
+    }
+    m_trayMenu->addAction(QStringLiteral("Новое окно"), this, [this] { newWindow(); });
+    m_trayMenu->addSeparator();
+    m_trayMenu->addAction(QStringLiteral("Диагностика"), this, &AppController::openDiagnostics);
+    m_trayMenu->addSeparator();
+    m_trayMenu->addAction(QStringLiteral("Выход"), this, &AppController::quit);
 }

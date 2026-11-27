@@ -10,6 +10,7 @@
 #include <QSysInfo>
 #include <QFileInfo>
 #include <QFont>
+#include <QApplication>
 #include <QGuiApplication>
 #include <QLocalSocket>
 #include <QPalette>
@@ -76,7 +77,8 @@ int main(int argc, char *argv[])
     QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
     QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
 
-    QGuiApplication app(argc, argv);
+    // QApplication (not QGuiApplication): the tray icon and its menu are widgets.
+    QApplication app(argc, argv);
     QGuiApplication::setApplicationName(QStringLiteral("hmi-vms"));
     QGuiApplication::setOrganizationName(QStringLiteral("hmi"));
     QGuiApplication::setApplicationDisplayName(QStringLiteral("CAMAI VMS"));

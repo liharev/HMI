@@ -17,6 +17,9 @@ class QQmlEngine;
 class QQmlComponent;
 class QQuickWindow;
 class QLocalServer;
+class QMenu;
+class QSystemTrayIcon;
+class Branding;
 class VmsWindow;
 class Player;
 
@@ -51,6 +54,11 @@ class AppController : public QObject
     // Output device for the sound ("" = system default) and the devices found.
     Q_PROPERTY(QString audioDevice READ audioDevice WRITE setAudioDevice NOTIFY settingsChanged)
     Q_PROPERTY(QStringList audioDevices READ audioDevices NOTIFY audioDevicesChanged)
+    // Icons: 0 = by the system theme, 1 = for a light theme, 2 = for a dark theme.
+    Q_PROPERTY(int iconStyle READ iconStyle WRITE setIconStyle NOTIFY settingsChanged)
+    Q_PROPERTY(bool trayIcon READ trayIcon WRITE setTrayIcon NOTIFY settingsChanged)
+    Q_PROPERTY(bool trayAvailable READ trayAvailable NOTIFY settingsChanged)
+    Q_PROPERTY(QString themeInfo READ themeInfo NOTIFY settingsChanged)
 
 public:
     AppController(QQmlEngine *engine, bool glSink, const QString &configPath, QObject *parent = nullptr);
@@ -83,6 +91,13 @@ public:
     void setAudioDevice(const QString &name);
     QStringList audioDevices() const { return m_audioDevices; }
     Q_INVOKABLE void refreshAudioDevices();
+    int iconStyle() const;
+    void setIconStyle(int style);
+    bool trayIcon() const { return m_trayEnabled; }
+    void setTrayIcon(bool on);
+    bool trayAvailable() const;
+    QString themeInfo() const;
+    Q_INVOKABLE void showAllWindows();
     // Reads resolution / frame rate / codec / audio of a stream (async);
     // the result comes with probeFinished(id, ...).
     Q_INVOKABLE int probeStream(const QString &url, const QString &user, const QString &password);
@@ -160,6 +175,13 @@ private:
     bool m_quitting = false;
     int m_probeId = 0;
     QStringList m_audioDevices;
+    Branding *m_branding = nullptr;
+    QSystemTrayIcon *m_tray = nullptr;
+    QMenu *m_trayMenu = nullptr;
+    bool m_trayEnabled = true;
+    bool m_trayRetry = false;
+    void updateTray();
+    void fillTrayMenu();
     void settingsUpdated();
     // Window not visible (minimised, not shown by the compositor, display
     // switched off): its players stop after a delay.
