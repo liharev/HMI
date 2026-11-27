@@ -1,0 +1,78 @@
+diff -ru orig/drm_gpuvm.c new/drm_gpuvm.c
+--- a/drm_gpuvm.c	2026-11-27 10:13:09.286926367 +0000
++++ b/drm_gpuvm.c	2026-11-27 10:13:09.342702622 +0000
+@@ -1147,6 +1147,13 @@
+ 
+ 	drm_gpuvm_resv_assert_held(gpuvm);
+ 	list_for_each_entry(vm_bo, &gpuvm->extobj.list, list.entry.extobj) {
++		/* HMI debug: an object being freed must not be in the list. */
++		if (!kref_read(&vm_bo->obj->refcount)) {
++			pr_err("panthor-debug: extobj vm_bo %p obj %p (size %zu, imported %d) has refcount 0 in %s, skipped\n",
++			       vm_bo, vm_bo->obj, vm_bo->obj->size, drm_gem_is_imported(vm_bo->obj), gpuvm->name);
++			dump_stack();
++			continue;
++		}
+ 		ret = exec_prepare_obj(exec, vm_bo->obj, num_fences);
+ 		if (ret)
+ 			break;
+@@ -1507,6 +1514,11 @@
+ 
+ 	if (!lock)
+ 		drm_gpuvm_resv_assert_held(gpuvm);
++	/* HMI debug: the lists are protected by the VM resv (no lockdep here). */
++	if (!lock && !dma_resv_is_locked(drm_gpuvm_resv(gpuvm))) {
++		pr_err("panthor-debug: vm_bo %p destroyed without the VM resv held (%s)\n", vm_bo, gpuvm->name);
++		dump_stack();
++	}
+ 
+ 	drm_gpuvm_bo_list_del(vm_bo, extobj, lock);
+ 	drm_gpuvm_bo_list_del(vm_bo, evict, lock);
+@@ -1675,6 +1687,10 @@
+ 
+ 	if (!lock)
+ 		drm_gpuvm_resv_assert_held(gpuvm);
++	if (!lock && !dma_resv_is_locked(drm_gpuvm_resv(gpuvm))) {
++		pr_err("panthor-debug: extobj add of vm_bo %p without the VM resv held (%s)\n", vm_bo, gpuvm->name);
++		dump_stack();
++	}
+ 
+ 	if (drm_gpuvm_is_extobj(gpuvm, vm_bo->obj))
+ 		drm_gpuvm_bo_list_add(vm_bo, extobj, lock);
+@@ -2748,5 +2764,6 @@
+ }
+ EXPORT_SYMBOL_GPL(drm_gpuva_ops_free);
+ 
++MODULE_INFO(hmi_debug, "1");
+ MODULE_DESCRIPTION("DRM GPUVM");
+ MODULE_LICENSE("GPL");
+diff -ru orig/panthor/panthor_drv.c new/panthor/panthor_drv.c
+--- a/panthor/panthor_drv.c	2026-11-27 10:13:09.285334296 +0000
++++ b/panthor/panthor_drv.c	2026-11-27 10:13:09.342358271 +0000
+@@ -1723,6 +1723,7 @@
+ }
+ module_exit(panthor_exit);
+ 
++MODULE_INFO(hmi_debug, "1");
+ MODULE_AUTHOR("Panthor Project Developers");
+ MODULE_DESCRIPTION("Panthor DRM Driver");
+ MODULE_LICENSE("Dual MIT/GPL");
+diff -ru orig/panthor/panthor_gem.c new/panthor/panthor_gem.c
+--- a/panthor/panthor_gem.c	2026-11-27 10:13:09.285304294 +0000
++++ b/panthor/panthor_gem.c	2026-11-27 10:13:09.342069871 +0000
+@@ -63,6 +63,16 @@
+ 	struct panthor_gem_object *bo = to_panthor_bo(obj);
+ 	struct drm_gem_object *vm_root_gem = bo->exclusive_vm_root_gem;
+ 
++	/* HMI debug: a vm_bo holds a reference on its GEM, so a GEM freed
++	 * while still attached to a VM means a reference was dropped too many
++	 * times: the stack below shows who dropped the last one.
++	 */
++	if (!list_empty(&obj->gpuva.list)) {
++		pr_err("panthor-debug: GEM %p (size %zu, imported %d, dma_buf %p) freed while still attached to a VM\n",
++		       obj, obj->size, drm_gem_is_imported(obj), obj->dma_buf);
++		dump_stack();
++	}
++
+ 	panthor_gem_debugfs_bo_rm(bo);
+ 
+ 	/*
