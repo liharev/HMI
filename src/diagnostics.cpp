@@ -118,7 +118,7 @@ QVariantMap Diagnostics::streamsSection()
     int good = 0, warnN = 0, badN = 0, off = 0, hidden = 0;
     qreal shown = 0, nominal = 0, bitrate = 0;
     QVariantList problems;
-    bool display = false, decoder = false, source = false, noVideo = false;   // by health text
+    bool display = false, decoder = false, source = false, noVideo = false, late = false;   // by health text
     for (Player *p : players) {
         switch (p->health()) {
         case Player::HealthGood: ++good; break;
@@ -144,6 +144,7 @@ QVariantMap Diagnostics::streamsSection()
             decoder |= t.contains(QStringLiteral("Декодер"));
             source |= t.contains(QStringLiteral("Источник")) || t.contains(QStringLiteral("Перебои"));
             noVideo |= t.contains(QStringLiteral("Нет видео")) || t.contains(QStringLiteral("Нет новых"));
+            late |= t.contains(QStringLiteral("опаздывают"));
         }
     }
     m_streamsMbps = bitrate;
@@ -157,6 +158,11 @@ QVariantMap Diagnostics::streamsSection()
     if (source)
         advice << QStringLiteral("Мало кадров от источника: проверьте сеть (раздел «Сеть»), для RTSP попробуйте "
                                  "транспорт TCP, уменьшите битрейт или используйте дополнительный поток камеры.");
+    if (late)
+        advice << QStringLiteral("Кадры опаздывают к показу: элементам конвейера (буфер сети, декодер) нужно больше "
+                                 "времени, чем задано буфером плавности. Программа сама увеличивает буфер (до +1,5 с); "
+                                 "если сообщение не проходит, увеличьте «Буфер» в «Настройках программы» или выберите "
+                                 "для плеера «Минимальная задержка».");
     if (decoder)
         advice << QStringLiteral("Декодер не успевает: см. раздел «Видеодекодер».");
     if (display)
@@ -331,34 +337,67 @@ QVariantMap Diagnostics::memorySection()
     const qint64 cmaT = mi.value(QStringLiteral("CmaTotal"));
     const qint64 cmaF = mi.value(QStringLiteral("CmaFree"));
 
-    int st = rate(used, 0.8, 0.9);
+    // Thresholds by what is still available (MemAvailable: free + reclaimable
+    // cache), not by "used": Linux always fills free RAM with cache, and on
+    // a desktop the other programs take their share. Trouble starts when
+    // little is left or the system has to wait for memory.
+    const qint64 mb = 1024;                       // meminfo is in kB
+    const qint64 warnAvail = qMax<qint64>(512 * mb, total / 10);
+    const qint64 badAvail = qMax<qint64>(256 * mb, total / 20);
+    const int availSt = total <= 0 ? 0 : avail < badAvail ? 2 : avail < warnAvail ? 1 : 0;
+    int st = availSt;
     QStringList advice;
-    if (st > 0)
-        advice << QStringLiteral("Мало свободной памяти: закройте лишние программы, уменьшите число плееров "
-                                 "или используйте потоки с меньшим разрешением.");
-    if (swapT > 0 && swapT - swapF > swapT / 4) {
+    if (availSt > 0)
+        advice << QStringLiteral("Мало доступной памяти (%1, порог замечания — %2): закройте лишние программы, уменьшите "
+                                 "число плееров или используйте потоки с меньшим разрешением.")
+                      .arg(gib(avail), gib(warnAvail));
+
+    // Real shortage: pages read back from swap and the kernel's pressure
+    // stall information (share of time processes waited for memory). How
+    // much swap is merely occupied says nothing (zram keeps idle pages).
+    qint64 swapIn = -1;
+    for (const QByteArray &l : readFile(QStringLiteral("/proc/vmstat")).split('\n'))
+        if (l.startsWith("pswpin "))
+            swapIn = l.mid(7).trimmed().toLongLong();
+    const qreal swapInMBs = (swapIn >= 0 && m_swapInPrev >= 0) ? (swapIn - m_swapInPrev) * 4096.0 / m_dt / 1e6 : 0;
+    m_swapInPrev = swapIn;
+    qreal psiSome = -1, psiFull = -1;
+    for (const QByteArray &l : readFile(QStringLiteral("/proc/pressure/memory")).split('\n')) {
+        const int i = l.indexOf("avg10=");
+        if (i < 0)
+            continue;
+        const qreal v = l.mid(i + 6).split(' ').value(0).toDouble();
+        if (l.startsWith("some"))
+            psiSome = v;
+        else if (l.startsWith("full"))
+            psiFull = v;
+    }
+    if (psiFull >= 10 || swapInMBs >= 20) {
+        st = worse(st, 2);
+        advice << QStringLiteral("Системе не хватает памяти: программы ждут, пока ядро возвращает данные из подкачки "
+                                 "(видео и интерфейс подтормаживают).");
+    } else if (psiSome >= 10 || swapInMBs >= 2) {
         st = worse(st, 1);
-        advice << QStringLiteral("Активно используется файл подкачки — это замедляет работу.");
+        advice << QStringLiteral("Идёт подкачка: часть данных программ возвращается из файла/zram подкачки, это замедляет работу.");
     }
     QVariantList bars;
-    bars << bar(QStringLiteral("ОЗУ"), used, rate(used, 0.8, 0.9),
-                QStringLiteral("%1 из %2").arg(gib(total - avail), gib(total)));
-    if (cmaT > 0) {
-        const qreal cu = 1.0 - qreal(cmaF) / cmaT;
-        const int cs = rate(cu, 0.85, 0.95);
-        bars << bar(QStringLiteral("CMA (видеобуферы)"), cu, cs,
+    bars << bar(QStringLiteral("ОЗУ"), used, availSt, QStringLiteral("%1 из %2").arg(gib(total - avail), gib(total)));
+    // CMA is only shown: free CMA is lent by the kernel to ordinary data, so
+    // it is usually "full" without any harm. The RK3588 video decoders work
+    // through the IOMMU and do not need it.
+    if (cmaT > 0)
+        bars << bar(QStringLiteral("CMA (резерв ядра)"), 1.0 - qreal(cmaF) / cmaT, 0,
                     QStringLiteral("%1 из %2 МБ").arg((cmaT - cmaF) / 1024).arg(cmaT / 1024));
-        if (cs > 0) {
-            st = worse(st, cs);
-            advice << QStringLiteral("Заканчивается CMA-память для видеобуферов декодера: увеличьте её параметром ядра "
-                                     "(в /boot/armbianEnv.txt: extraargs=cma=1024M) и перезагрузитесь.");
-        }
-    }
     if (swapT > 0)
         bars << bar(QStringLiteral("Подкачка"), qreal(swapT - swapF) / swapT, 0, gib(swapT - swapF));
 
     // Who uses the memory (only when it is tight: scanning /proc costs a bit).
-    QVariantList details{kv(QStringLiteral("Использует CAMAI VMS"), QStringLiteral("%1 МБ").arg(rss / 1024))};
+    QVariantList details{kv(QStringLiteral("Использует CAMAI VMS"), QStringLiteral("%1 МБ").arg(rss / 1024)),
+                         kv(QStringLiteral("Доступно"), gib(avail)),
+                         kv(QStringLiteral("Чтение из подкачки"), QStringLiteral("%1 МБ/с").arg(qMax<qreal>(0, swapInMBs), 0, 'f', 1))};
+    if (psiSome >= 0)
+        details << kv(QStringLiteral("Ожидание памяти (PSI, 10 с)"),
+                      QStringLiteral("%1% / полностью %2%").arg(psiSome, 0, 'f', 1).arg(qMax<qreal>(0, psiFull), 0, 'f', 1));
     if (st > 0) {
         QList<QPair<qint64, QString>> procs;
         QHash<QString, qint64> byName;
@@ -452,7 +491,9 @@ QVariantMap Diagnostics::networkSection()
         if (p->status() != Player::Playing || p->nominalFps() <= 0)
             continue;
         ++playing;
-        if (p->inFps() < 0.8 * p->nominalFps())
+        // Cameras lower the rate by themselves (little light): only a clear
+        // shortfall counts.
+        if (p->inFps() < 0.5 * p->nominalFps())
             ++starved;
     }
 

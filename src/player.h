@@ -80,6 +80,8 @@ class Player : public QObject
     Q_PROPERTY(bool hardwareDecoding READ hardwareDecoding NOTIFY videoInfoChanged)
     Q_PROPERTY(qreal fps READ fps NOTIFY statsChanged)              // decoded frames/s
     Q_PROPERTY(qreal inFps READ inFps NOTIFY statsChanged)          // received (to decoder)
+    Q_PROPERTY(qreal lateFps READ lateFps NOTIFY statsChanged)      // dropped as late for display
+    Q_PROPERTY(int bufferMs READ bufferMs NOTIFY statsChanged)      // smooth buffer in use, 0 = none
     Q_PROPERTY(qreal shownFps READ shownFps NOTIFY statsChanged)    // delivered to the screen
     Q_PROPERTY(qreal nominalFps READ nominalFps NOTIFY statsChanged) // from the stream, 0 = unknown
     Q_PROPERTY(qreal refFps READ refFps NOTIFY statsChanged)         // reference: nominal or measured
@@ -239,6 +241,8 @@ public:
     bool hardwareDecoding() const { return m_hwDecoding; }
     qreal fps() const { return m_fps; }
     qreal inFps() const { return m_inFps; }
+    qreal lateFps() const { return m_lateFps; }
+    int bufferMs() const { return m_bufferMs; }
     qreal shownFps() const { return m_shownFps; }
     // Frame rate declared by the stream, unless the source clearly sends
     // more (wrong or missing value in the stream description): then 0.
@@ -427,6 +431,9 @@ private:
     void rebuild(const QString &reason);   // restart keeping the fallbacks
     void checkOutputSpeed();
     void onFirstFrame(quint64 gen);
+    void onLatencyChanged(quint64 gen);
+    void adjustLatency();
+    void syncCounters(PipelineCtx *ctx);
 
     GstElement *buildTail(PipelineCtx *ctx, QString *error);
     GstElement *makeAppSrc(const char *caps, bool doTimestamp);
@@ -483,6 +490,16 @@ private:
     quint64 m_lastUploaded = 0;
     qreal m_nominalFps = 0;
     qreal m_inFpsSlow = 0;     // long-term average of the received rate
+    qreal m_lateFps = 0;       // frames dropped as late for their display time (QoS)
+    qreal m_lateUpFps = 0;     // ... of them before the sink (mostly by the decoder)
+    quint64 m_lastLateUp = 0;
+    quint64 m_lastLateSink = 0;
+    int m_lateTicks = 0;
+    int m_latencyCheck = 0;
+    int m_latencyExtraMs = 0;  // smooth buffer added because frames came late
+    qreal m_lateBeforeRaise = 0;
+    bool m_latencyGaveUp = false;  // a longer buffer did not help (output too slow)
+    int m_bufferMs = 0;        // smooth buffer in use (0 = not smooth)
     qreal m_frameAge = 0;
     qreal m_renderFps = -1;
     int m_health = HealthNone;

@@ -126,6 +126,11 @@ struct PipelineCtx
     std::atomic<quint64> inBytes{0};     // compressed bytes into the decoder
     std::atomic<quint64> shown{0};       // frames reaching the video sink
     std::atomic<quint64> uploaded{0};    // frames after glupload (GL path)
+    // Frames thrown away because they came too late for their display time
+    // (QoS): by the decoder / elements before the sink, and by the sink.
+    std::atomic<quint64> lateUp{0};
+    std::atomic<quint64> lateSink{0};
+    int baseLatencyMs = -1;              // smooth mode: buffer asked for (pipeline latency)
     bool debug = false;
     std::atomic<qint64> lastFrameUs{0};  // monotonic time of the last decoded frame
     std::atomic<bool> hasDecoderProbe{false};
@@ -312,6 +317,20 @@ struct PipelineCallbacks
         case GST_MESSAGE_EOS:
             ctx->postError(QStringLiteral("Поток завершён сервером"));
             break;
+        case GST_MESSAGE_QOS:
+            // Posted for every frame dropped as late (decoder or sink).
+            if (GST_MESSAGE_SRC(msg) == GST_OBJECT_CAST(ctx->sink))
+                ctx->lateSink.fetch_add(1, std::memory_order_relaxed);
+            else
+                ctx->lateUp.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case GST_MESSAGE_LATENCY: {
+            // An element changed its latency: the buffer is checked again.
+            Player *p = ctx->player;
+            const quint64 g = ctx->gen;
+            ctx->post([p, g] { p->onLatencyChanged(g); });
+            break;
+        }
         case GST_MESSAGE_PROGRESS: {
             // rtspsrc reports the steps of the RTSP exchange.
             GstProgressType type;
@@ -1756,7 +1775,8 @@ PipelineCtx *Player::buildPipeline(const QString &urlText, bool pending, QString
         // Frames are displayed this long after capture: network and decoder
         // irregularities within it do not reach the screen.
         const int ms = qMax(g_smoothMs, kind == Source::Rtsp ? m_latency + 100 : 0);
-        gst_pipeline_set_latency(GST_PIPELINE(pipe), GstClockTime(ms) * GST_MSECOND);
+        ctx->baseLatencyMs = ms;
+        gst_pipeline_set_latency(GST_PIPELINE(pipe), GstClockTime(ms + m_latencyExtraMs) * GST_MSECOND);
     }
 
     QString err;
@@ -1991,8 +2011,7 @@ void Player::activatePending()
     m_sourceUrl = resolveUrl(ctx->url, nullptr);
     m_stallLimit = ctx->stallLimit;
     resetStats();
-    m_lastFrames = ctx->frames.load(std::memory_order_relaxed);
-    m_lastIn = ctx->hasDecoderProbe ? ctx->inFrames.load(std::memory_order_relaxed) : m_lastFrames;
+    syncCounters(ctx);
     m_lastBytes = ctx->inBytes.load(std::memory_order_relaxed);
     m_stallTicks = 0;
     m_connectTicks = 0;
@@ -2270,9 +2289,36 @@ void Player::onMseBinary(quint64 gen, const QByteArray &data)
         pushToAppSrc(data);
 }
 
+// Statistics continue from the current counters of the pipeline (no jump
+// of the rates when a prepared or paused pipeline becomes the shown one).
+void Player::syncCounters(PipelineCtx *ctx)
+{
+    m_lastFrames = ctx->frames.load(std::memory_order_relaxed);
+    m_lastIn = ctx->hasDecoderProbe ? ctx->inFrames.load(std::memory_order_relaxed) : m_lastFrames;
+    m_lastBytes = ctx->inBytes.load(std::memory_order_relaxed);
+    m_lastUploaded = ctx->uploaded.load(std::memory_order_relaxed);
+    m_lastLateUp = ctx->lateUp.load(std::memory_order_relaxed);
+    m_lastLateSink = ctx->lateSink.load(std::memory_order_relaxed);
+    m_lastShown = (ctx->glSink ? ctx->shown.load(std::memory_order_relaxed) : m_qtShown.load(std::memory_order_relaxed))
+                  - (ctx->glSink ? m_lastLateSink : 0);
+}
+
+// HMI_NO_LATENCY_FIX: developer aid - the smooth buffer stays as configured
+// (to compare with the behaviour before the latency correction).
+static bool noLatencyFix()
+{
+    static const bool v = qEnvironmentVariableIsSet("HMI_NO_LATENCY_FIX");
+    return v;
+}
+
 void Player::resetStats()
 {
     m_fps = m_inFps = m_shownFps = m_frameAge = 0;
+    m_lateFps = m_lateUpFps = 0;
+    m_bufferMs = 0;
+    m_lastLateUp = m_lastLateSink = 0;
+    m_lateTicks = m_latencyCheck = 0;
+    m_latencyGaveUp = false;
     m_lastIn = m_lastShown = m_lastUploaded = m_lastBytes = 0;
     m_bitrate = 0;
     m_uploadFps = 0;
@@ -2463,10 +2509,47 @@ void Player::onWatchdog()
     m_inFps = ema(m_inFps, in - m_lastIn);
     m_inFpsSlow = m_inFpsSlow <= 0 ? m_inFps : m_inFpsSlow * 0.9 + m_inFps * 0.1;
     m_lastIn = in;
-    const quint64 shown = m_ctx->glSink ? m_ctx->shown.load(std::memory_order_relaxed)
-                                        : m_qtShown.load(std::memory_order_relaxed);
-    m_shownFps = ema(m_shownFps, shown - m_lastShown);
+    const quint64 lateSink = m_ctx->lateSink.load(std::memory_order_relaxed);
+    const quint64 lateUp = m_ctx->lateUp.load(std::memory_order_relaxed);
+    // The sink counts a frame on arrival; the ones it then drops were not shown.
+    const quint64 shown = (m_ctx->glSink ? m_ctx->shown.load(std::memory_order_relaxed)
+                                         : m_qtShown.load(std::memory_order_relaxed))
+                          - (m_ctx->glSink ? lateSink : 0);
+    m_shownFps = qMax<qreal>(0, ema(m_shownFps, shown - m_lastShown));
     m_lastShown = shown;
+    m_lateUpFps = ema(m_lateUpFps, lateUp - m_lastLateUp);
+    m_lateFps = ema(m_lateFps, (lateUp + lateSink) - (m_lastLateUp + m_lastLateSink));
+    m_lastLateUp = lateUp;
+    m_lastLateSink = lateSink;
+    if (m_ctx->smooth && m_gotFrame && !noLatencyFix()) {
+        // Frames still late for several seconds: a longer buffer.
+        if (m_lateFps > 0.5 && !m_latencyGaveUp) {
+            if (++m_lateTicks >= 3) {
+                m_lateTicks = 0;
+                if (m_latencyExtraMs > 0 && m_lateFps > 0.7 * m_lateBeforeRaise) {
+                    // A longer buffer did not help: the output cannot keep up
+                    // (throughput, not delay). Back to the normal buffer.
+                    qInfo("[%s] frames stay late with a longer buffer: the output is too slow, buffer back to normal",
+                          qPrintable(m_name));
+                    m_latencyExtraMs = 0;
+                    m_latencyGaveUp = true;
+                    adjustLatency();
+                } else if (m_latencyExtraMs < 1500) {
+                    m_lateBeforeRaise = m_lateFps;
+                    m_latencyExtraMs += 250;
+                    adjustLatency();
+                } else {
+                    m_latencyGaveUp = true;
+                }
+            }
+        } else {
+            m_lateTicks = 0;
+        }
+        if (++m_latencyCheck >= 10) {      // elements may change their latency silently
+            m_latencyCheck = 0;
+            adjustLatency();
+        }
+    }
     const quint64 bytes = m_ctx->inBytes.load(std::memory_order_relaxed);
     m_bitrate = ema(m_bitrate * 1e6 / 8.0, bytes - m_lastBytes) * 8.0 / 1e6;   // EMA in bytes/s
     m_bitrate = qMax<qreal>(0, m_bitrate);
@@ -2479,9 +2562,10 @@ void Player::onWatchdog()
     updateHealth();
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
-        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f interval %.1f jitter %.1f ms %s path %s decoder %s audio %s/%llu | %s",
-              qPrintable(m_name), m_inFps, m_fps, m_uploadFps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge,
+        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f late %.1f render %.1f nominal %.1f age %.2f interval %.1f jitter %.1f ms %s %d ms path %s decoder %s audio %s/%llu | %s",
+              qPrintable(m_name), m_inFps, m_fps, m_uploadFps, m_shownFps, m_lateFps, m_renderFps, m_nominalFps, m_frameAge,
               m_ctx->intervalUs.load() / 1000.0, m_ctx->jitterUs.load() / 1000.0, m_ctx->smooth ? "smooth" : "low-latency",
+              m_bufferMs,
               qPrintable(renderPath()), qPrintable(m_decoderName), m_audioOn ? "on" : "off",
               (unsigned long long)m_ctx->audioBuffers.load(std::memory_order_relaxed),
               qPrintable(QString(m_healthText).replace(QLatin1Char('\n'), QLatin1String(" / "))));
@@ -2539,9 +2623,12 @@ qreal Player::pixelRate() const
     return qreal(m_videoWidth) * m_videoHeight * rate;
 }
 
+// The decoder itself is behind: it outputs clearly fewer frames than it
+// receives. Frames missing at the source and frames dropped as late for
+// their display time (QoS) are not the decoder's capacity.
 bool Player::decoderLagging() const
 {
-    return m_status == Playing && nominalFps() > 0 && m_fps < 0.85 * nominalFps();
+    return m_status == Playing && m_inFps >= 2 && m_fps + m_lateUpFps < 0.85 * m_inFps;
 }
 
 QString Player::renderPath() const
@@ -2642,22 +2729,29 @@ void Player::updateHealth()
         if (m_frameAge >= redAge) {
             h = HealthBad;
             t = QStringLiteral("Нет новых кадров %1 с").arg(f1(m_frameAge));
-        } else if (ref >= 2 && shown < 0.8 * ref) {
-            // Which stage loses the frames: source/network -> decoder -> display.
-            const qreal lossSource = nominalFps() > 0 ? qMax<qreal>(0, 1 - m_inFps / nominalFps()) : 0;
-            const qreal lossDecoder = m_inFps > 0.5 ? qMax<qreal>(0, 1 - m_fps / m_inFps) : 0;
-            const qreal lossDisplay = m_fps > 0.5 ? qMax<qreal>(0, 1 - shown / m_fps) : 0;
-            h = shown < 0.3 * ref ? HealthBad : HealthWarning;
-            if (lossSource >= lossDecoder && lossSource >= lossDisplay)
-                t = QStringLiteral("Источник/сеть присылают мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(ref));
+        } else if (m_inFps >= 2 && shown < 0.8 * m_inFps) {
+            // Frames received but not shown. Which stage loses them:
+            // decoder -> lateness (QoS) -> display.
+            const qreal in = m_inFps;
+            const qreal lateSinkFps = qMax<qreal>(0, m_lateFps - m_lateUpFps);
+            const qreal lossDecoder = qMax<qreal>(0, 1 - (m_fps + m_lateUpFps) / in);
+            const qreal lossLate = m_lateFps / in;
+            const qreal lossDisplay = m_fps > 0.5 ? qMax<qreal>(0, 1 - (shown + lateSinkFps) / m_fps) : 0;
+            h = shown < 0.3 * in ? HealthBad : HealthWarning;
+            if (lossLate >= lossDecoder && lossLate >= lossDisplay && !m_latencyGaveUp)
+                t = QStringLiteral("Кадры опаздывают к показу и пропускаются: показано %1 из %2 к/с").arg(f1(shown), f1(in))
+                    + (m_ctx && m_ctx->smooth ? QStringLiteral(" (буфер увеличивается автоматически)") : QString());
+            else if (lossLate >= lossDecoder && lossLate >= lossDisplay)
+                t = QStringLiteral("Отображение не успевает: кадры опаздывают к показу, показано %1 из %2 к/с "
+                                   "(перегружен GPU/вывод)").arg(f1(shown), f1(in));
             else if (lossDecoder >= lossDisplay)
-                t = QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(m_inFps));
+                t = QStringLiteral("Декодер не успевает: %1 из %2 к/с").arg(f1(m_fps), f1(in));
             else
                 t = (h == HealthBad ? QStringLiteral("Отображение не успевает: %1 из %2 к/с (перегружен GPU/вывод)")
                                     : QStringLiteral("Отображение пропускает кадры: %1 из %2 к/с"))
                         .arg(f1(shown), f1(m_fps));
-        } else if (nominalFps() > 0 && m_inFps < 0.6 * nominalFps()) {
-            h = HealthWarning;
+        } else if (nominalFps() > 0 && m_inFps < 0.5 * nominalFps()) {
+            h = m_inFps < 0.25 * nominalFps() ? HealthBad : HealthWarning;
             t = QStringLiteral("Источник присылает мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(nominalFps()));
         } else if (m_frameAge >= yellowAge) {
             h = HealthWarning;
@@ -2668,6 +2762,11 @@ void Player::updateHealth()
         } else if (m_hwFailed && m_decoder == DecoderAuto) {
             h = HealthWarning;
             t = QStringLiteral("Аппаратный декодер не справился, работает программный");
+        } else if (nominalFps() > 0 && m_inFps < 0.8 * nominalFps()) {
+            // Regular frames, only fewer than declared: cameras lower the rate
+            // themselves (little light, settings) - not a fault of the station.
+            t = QStringLiteral("Камера присылает %1 из %2 к/с (так бывает при слабом освещении или по настройкам камеры)")
+                    .arg(f1(m_inFps), f1(nominalFps()));
         }
         if (!m_sourceNote.isEmpty() && h < HealthWarning) {
             h = HealthWarning;
@@ -2835,6 +2934,45 @@ void Player::onFirstFrame(quint64 gen)
     m_lastError.clear();
     endWait();
     setStatus(Playing, QString());
+    adjustLatency();
+}
+
+void Player::onLatencyChanged(quint64 gen)
+{
+    if (isActive(gen) && m_gotFrame)
+        adjustLatency();
+}
+
+// Smooth mode shows frames at capture time + a fixed delay (the pipeline
+// latency). It must never be shorter than what the elements really need
+// (network jitter buffer, parser, decoder reordering...): frames would then
+// always be late and the decoder / sink would throw many of them away (QoS) -
+// fewer frames and irregular motion. So the real minimum is queried and the
+// delay raised when needed; frames still dropped as late raise it further
+// (m_latencyExtraMs, adaptive, up to +1.5 s).
+void Player::adjustLatency()
+{
+    if (!m_ctx || !m_ctx->pipeline || !m_ctx->smooth || m_ctx->baseLatencyMs < 0 || noLatencyFix())
+        return;
+    GstQuery *q = gst_query_new_latency();
+    GstClockTime minLat = 0;
+    gboolean live = FALSE;
+    const bool ok = gst_element_query(m_ctx->pipeline, q);
+    if (ok)
+        gst_query_parse_latency(q, &live, &minLat, nullptr);
+    gst_query_unref(q);
+    if (!ok)
+        return;
+    const int minMs = GST_CLOCK_TIME_IS_VALID(minLat) ? int(minLat / GST_MSECOND) : 0;
+    const int target = qMax(m_ctx->baseLatencyMs, minMs + 100) + m_latencyExtraMs;
+    m_bufferMs = target;
+    const GstClockTime cur = gst_pipeline_get_latency(GST_PIPELINE(m_ctx->pipeline));
+    if (GST_CLOCK_TIME_IS_VALID(cur) && qAbs(int(cur / GST_MSECOND) - target) < 20)
+        return;
+    qInfo("[%s] smooth buffer %d ms (elements need %d ms, added for late frames %d ms)",
+          qPrintable(m_name), target, minMs, m_latencyExtraMs);
+    gst_pipeline_set_latency(GST_PIPELINE(m_ctx->pipeline), GstClockTime(target) * GST_MSECOND);
+    gst_bin_recalculate_latency(GST_BIN(m_ctx->pipeline));
 }
 
 // ---------------------------------------------------------------------------
@@ -2925,9 +3063,7 @@ void Player::setVisibility(bool visible, int hideDelayMs, const QString &reason)
                 // back, the stall watchdog reconnects as usual.
                 m_paused = false;
                 resetStats();
-                m_lastFrames = m_ctx->frames.load(std::memory_order_relaxed);
-                m_lastIn = m_ctx->hasDecoderProbe ? m_ctx->inFrames.load(std::memory_order_relaxed) : m_lastFrames;
-                m_lastBytes = m_ctx->inBytes.load(std::memory_order_relaxed);
+                syncCounters(m_ctx);
                 m_stallTicks = 0;
                 m_connectTicks = 0;
                 if (m_ctx->dropMode.load() != 0)

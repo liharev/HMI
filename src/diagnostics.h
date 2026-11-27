@@ -53,6 +53,7 @@ private:
     qreal m_dt = 2.0;
     QList<Cpu> m_cpuPrev;          // [0] = all cores, then per core
     QHash<QString, Net> m_netPrev;
+    qint64 m_swapInPrev = -1;      // pages read back from swap (/proc/vmstat pswpin)
     int m_status = 0;
     QString m_summary;
     QVariantList m_sections;

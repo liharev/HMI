@@ -392,6 +392,8 @@ Item {
                            + " · показ " + tile.player.shownFps.toFixed(1)
                            + " · перерисовка окна " + Math.max(0, tile.win.renderFps).toFixed(1) + " к/с"
                            + (tile.player.nominalFps > 0 ? " (номинал " + tile.player.nominalFps.toFixed(1) + ")" : "")
+                           + (tile.player.lateFps >= 0.05 ? "\nопоздали к показу " + tile.player.lateFps.toFixed(1) + " к/с" : "")
+                           + (tile.player.bufferMs > 0 ? "\nбуфер плавности " + tile.player.bufferMs + " мс" : "")
                          : "")
     }
 
