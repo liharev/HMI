@@ -130,11 +130,17 @@ int main(int argc, char *argv[])
         const QStringList v = kernel.section(QLatin1Char('-'), 0, 0).split(QLatin1Char('.'));
         const int major = v.value(0).toInt(), minor = v.value(1).toInt();
         const bool oldKernel = major < 6 || (major == 6 && minor < 12);
-        if (QFileInfo::exists(QStringLiteral("/sys/module/panthor"))
+        // The cause was found: the backported drm_shmem_helper unlocked a
+        // reservation in drm_gem_shmem_mmap() it never locked. With the
+        // fixed module (tools/panthor-debug, "fix-install") the GL output
+        // is safe and stays the default.
+        const bool shmemFixed = QFileInfo::exists(
+            QStringLiteral("/sys/module/drm_shmem_helper/parameters/hmi_mmap_lock_fix"));
+        if (QFileInfo::exists(QStringLiteral("/sys/module/panthor")) && !shmemFixed
             && (oldKernel || kernel.contains(QLatin1String("vendor")))) {
             render = QStringLiteral("qt");
             Player::setRenderNote(QStringLiteral("Вывод через GStreamer GL отключён: драйвер Mali panthor в ядре %1 "
-                                                 "приводит к сбою ядра (зависанию системы). Принудительно: --render gl")
+                                                 "приводит к сбою ядра (зависанию системы). Исправление: tools/panthor-debug/panthor-debug.sh fix-build / fix-install. Принудительно: --render gl")
                                       .arg(kernel));
             qWarning("panthor on kernel %s: GStreamer GL output disabled (kernel oops in drm_gpuvm); "
                      "use --render gl to force it", qPrintable(kernel));

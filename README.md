@@ -362,15 +362,29 @@ RK3588 (до 32 потоков 1080p@30, H.264 и H.265) даёт vendor-ядр�
 
 ### Система полностью зависает (ROCK 5T, ядро vendor 6.1 + panthor)
 
-Драйвер Mali **panthor**, перенесённый в vendor-ядро Rockchip 6.1 (overlay `panthor-gpu`),
-падает (kernel oops в `drm_gpuvm_prepare_objects`, `refcount_t: use-after-free`), когда в одном
-процессе несколько GL-контекстов отправляют задания на GPU — а вывод GStreamer GL
-(`qml6glsink`) создаёт свой контекст на каждый видеоэлемент. После этого не отвечают ни
-программы, ни мышь. Поэтому на таком ядре программа сама выбирает вывод **Qt Multimedia**
-(не использует GL-контексты GStreamer; кадр копируется, нагрузка на CPU немного выше); причина
-указана в «О программе» и «Диагностике». Принудительно вернуть GL-вывод: `hmi-vms --render gl`
-(не рекомендуется на этом ядре). Полностью проблему решают: драйвер Mali от Rockchip (libmali,
-`mali_kbase` vendor-ядра) вместо panthor или ядро ≥ 6.12 с исправленным panthor.
+Причина найдена: в модуле `drm_shmem_helper` vendor-ядра Armbian 6.1 (перенос из новых ядер
+для драйвера Mali **panthor**) функция `drm_gem_shmem_mmap()` освобождает блокировку
+(reservation) буфера, которую не захватывала — строка захвата потерялась при переносе (в
+основной ветке Linux она есть с v6.5). У большинства буферов Mesa эта блокировка общая с VM
+GPU, поэтому каждый `mmap` снимал чужую блокировку VM: портились списки объектов VM, затем
+следовал kernel oops в `drm_gpuvm_prepare_objects` (`refcount_t: use-after-free`), и
+система переставала отвечать. Чаще всего это происходит при выводе видео через GPU без копирования.
+
+Исправленный модуль собирается на плате (ядро не пересобирается):
+
+```bash
+sudo apt install linux-headers-vendor-rk35xx gcc-14
+tools/panthor-debug/panthor-debug.sh fix-build
+sudo tools/panthor-debug/panthor-debug.sh fix-install && sudo reboot
+tools/panthor-debug/panthor-debug.sh status      # «Исправление mmap-блокировки: ЗАГРУЖЕНО»
+```
+
+Откат: `sudo tools/panthor-debug/panthor-debug.sh fix-uninstall && sudo reboot`. После
+обновления ядра пакетом Armbian модуль нужно собрать заново (или Armbian исправит ошибку).
+
+Пока исправление не установлено, программа на таком ядре сама выбирает вывод **Qt
+Multimedia** (без GL-вывода GStreamer; причина указана в «О программе» и «Диагностике»). С
+исправленным модулем используется быстрый GL-вывод без копирования.
 
 ### Прочее
 

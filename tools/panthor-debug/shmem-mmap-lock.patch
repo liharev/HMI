@@ -1,0 +1,28 @@
+--- a/drm_gem_shmem_helper.c	2026-11-27 11:21:07.634512887 +0000
++++ b/drm_gem_shmem_helper.c	2026-11-27 11:21:07.647913086 +0000
+@@ -613,6 +613,13 @@
+ 	if (is_cow_mapping(vma->vm_flags))
+ 		return -EINVAL;
+ 
++	/* HMI fix: the backport lost this lock. Without it every mmap of a
++	 * shmem BO unlocked a reservation it did not hold - for panthor BOs
++	 * private to a VM that is the VM's reservation, released while held by
++	 * another task: corrupted VM object lists, use-after-free, kernel oops
++	 * in drm_gpuvm_prepare_objects() (upstream locks here since v6.5).
++	 */
++	dma_resv_lock(shmem->base.resv, NULL);
+ 	ret = drm_gem_shmem_get_pages(shmem);
+ 	dma_resv_unlock(shmem->base.resv);
+ 
+@@ -773,6 +780,11 @@
+ }
+ EXPORT_SYMBOL_GPL(drm_gem_shmem_prime_import_sg_table);
+ 
++/* Marker for applications: /sys/module/drm_shmem_helper/parameters/hmi_mmap_lock_fix */
++static bool hmi_mmap_lock_fix = true;
++module_param(hmi_mmap_lock_fix, bool, 0444);
++MODULE_PARM_DESC(hmi_mmap_lock_fix, "drm_gem_shmem_mmap() takes the reservation lock (HMI fix)");
++MODULE_INFO(hmi_fix, "1");
+ MODULE_DESCRIPTION("DRM SHMEM memory-management helpers");
+ MODULE_IMPORT_NS(DMA_BUF);
+ MODULE_LICENSE("GPL v2");
