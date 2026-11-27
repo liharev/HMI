@@ -602,7 +602,7 @@ void AppController::updateWindowVisibility(VmsWindow *w)
         reason = QStringLiteral("окно не выводится на экран (закрыто другими окнами, на другом рабочем столе "
                                 "или экран погашен)");
         delay = 5000;
-    } else if (QScreen *scr = v->screen()) {
+    } else if (QScreen *scr = qEnvironmentVariableIsSet("HMI_NO_DISPLAY_POLL") ? nullptr : v->screen()) {
         // A display that is switched off keeps its place in the desktop
         // (the window does not move): only the connector tells.
         const DisplayState d = displayState(scr->name());

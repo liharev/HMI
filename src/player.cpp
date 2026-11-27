@@ -324,7 +324,11 @@ struct PipelineCallbacks
         // without it every message (QoS ones arrive continuously) and the
         // element it refers to - up to whole stopped pipelines with their
         // decoder buffers - stayed in memory forever.
-        gst_message_unref(msg);
+        // HMI_KEEP_BUS_MESSAGES=1: the old behaviour (messages and stopped
+        // pipelines are never freed) - only to compare when diagnosing.
+        static const bool keep = qEnvironmentVariableIsSet("HMI_KEEP_BUS_MESSAGES");
+        if (!keep)
+            gst_message_unref(msg);
         return GST_BUS_DROP;
     }
 
@@ -2210,6 +2214,9 @@ void Player::releasePipeline(PipelineCtx *ctx, bool synchronous, std::function<v
 {
     if (!ctx)
         return;
+    if (qEnvironmentVariableIsSet("HMI_DEBUG_RELEASE"))
+        qInfo("[%s] stopping %s (%s)", qPrintable(m_name), GST_OBJECT_NAME(ctx->pipeline),
+              qPrintable(QUrl(ctx->url).toString(QUrl::RemoveUserInfo)));
     ctx->kill();
     GstElement *pipe = ctx->pipeline;
     ++m_teardowns;
@@ -2228,9 +2235,13 @@ void Player::releasePipeline(PipelineCtx *ctx, bool synchronous, std::function<v
         // sessions, decoder buffers, threads) would never be freed.
         gst_bus_set_flushing(bus, TRUE);
         gst_object_unref(bus);
-        if (qEnvironmentVariableIsSet("HMI_DEBUG_REFS"))
-            qInfo("release %s: refcount %d", GST_OBJECT_NAME(pipe), GST_OBJECT_REFCOUNT_VALUE(pipe));
+        static const bool debugRelease = qEnvironmentVariableIsSet("HMI_DEBUG_RELEASE");
+        const QByteArray pname = GST_OBJECT_NAME(pipe);
+        if (debugRelease)
+            qInfo("release %s: stopped, refcount %d, freeing...", pname.constData(), GST_OBJECT_REFCOUNT_VALUE(pipe));
         gst_object_unref(pipe);
+        if (debugRelease)
+            qInfo("release %s: freed", pname.constData());
         delete ctx;
         QMetaObject::invokeMethod(qApp, [self] { if (self) self->onTeardownDone(); }, Qt::QueuedConnection);
     };
@@ -2774,6 +2785,10 @@ void Player::setZOrder(int z)
 
 void Player::setVisibility(bool visible, int hideDelayMs, const QString &reason)
 {
+    // HMI_NO_HIDE=1: never stop invisible players (diagnostics / comparison).
+    static const bool noHide = qEnvironmentVariableIsSet("HMI_NO_HIDE");
+    if (noHide)
+        visible = true;
     if (visible) {
         m_hideTimer.stop();
         m_wantHidden = false;
