@@ -21,6 +21,8 @@ Dialog {
         waitBox.value = Math.round(App.streamWaitMs / 100)
         autoCheck.checked = App.autoQuality
         fpsBox.value = Math.round(App.minTileFps)
+        smoothCheck.checked = App.smoothPlayback
+        bufferBox.value = App.smoothBufferMs
         App.refreshAudioDevices()
         audioBox.currentIndex = Math.max(0, audioBox.model.indexOf(App.audioDevice))
     }
@@ -104,6 +106,38 @@ Dialog {
                       + "(например, у CAMAI превью 360p идёт с 5 к/с, 480p — с 10 к/с)."
             }
             Label {
+                text: "Плавность"
+                font.bold: true
+                Layout.topMargin: Math.round(dlg.em * 0.5)
+            }
+            CheckBox {
+                id: smoothCheck
+                text: "Плавное воспроизведение (кадры по их времени)"
+            }
+            RowLayout {
+                enabled: smoothCheck.checked
+                spacing: Math.round(dlg.em * 0.5)
+                Label { text: "Буфер" }
+                SpinBox {
+                    id: bufferBox
+                    from: 100
+                    to: 3000
+                    stepSize: 100
+                    editable: true
+                    Layout.preferredWidth: dlg.em * 7
+                }
+                Label { text: "мс" }
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: "#9ca3af"
+                font.pixelSize: Math.round(dlg.em * 0.8)
+                text: "Видео показывается с задержкой на размер буфера, зато неравномерная доставка по сети и "
+                      + "рывки декодера не видны: объекты движутся равномерно. Больше буфер — плавнее при плохой "
+                      + "сети, но больше задержка. По умолчанию — включено, 500 мс. У плеера можно выбрать иначе."
+            }
+            Label {
                 text: "Звук"
                 font.bold: true
                 Layout.topMargin: Math.round(dlg.em * 0.5)
@@ -143,6 +177,8 @@ Dialog {
                     autoCheck.checked = true
                     fpsBox.value = 10
                     audioBox.currentIndex = 0
+                    smoothCheck.checked = true
+                    bufferBox.value = 500
                 }
             }
         }
@@ -157,5 +193,7 @@ Dialog {
         App.autoQuality = autoCheck.checked
         App.minTileFps = fpsBox.value
         App.audioDevice = audioBox.currentIndex > 0 ? audioBox.currentText : ""
+        App.smoothBufferMs = bufferBox.value
+        App.smoothPlayback = smoothCheck.checked
     }
 }

@@ -43,7 +43,10 @@ class Player : public QObject
     Q_PROPERTY(int transport READ transport NOTIFY configChanged)
     Q_PROPERTY(int latency READ latency NOTIFY configChanged)
     Q_PROPERTY(int decoder READ decoder NOTIFY configChanged)
-    Q_PROPERTY(bool lowLatency READ lowLatency NOTIFY configChanged)
+    // Playback pacing: 0 - as in the application settings, 1 - minimum
+    // latency (frames shown as soon as decoded), 2 - smooth (shown by their
+    // timestamps after a jitter buffer).
+    Q_PROPERTY(int playMode READ playMode NOTIFY configChanged)
     Q_PROPERTY(int snapshotInterval READ snapshotInterval NOTIFY configChanged)
     Q_PROPERTY(QString sourceType READ sourceType NOTIFY configChanged)
     Q_PROPERTY(QString webUrl READ webUrl WRITE setWebUrl NOTIFY configChanged)
@@ -79,6 +82,8 @@ class Player : public QObject
     Q_PROPERTY(qreal inFps READ inFps NOTIFY statsChanged)          // received (to decoder)
     Q_PROPERTY(qreal shownFps READ shownFps NOTIFY statsChanged)    // delivered to the screen
     Q_PROPERTY(qreal nominalFps READ nominalFps NOTIFY statsChanged) // from the stream, 0 = unknown
+    Q_PROPERTY(qreal refFps READ refFps NOTIFY statsChanged)         // reference: nominal or measured
+    Q_PROPERTY(qreal displayFps READ displayFps NOTIFY statsChanged)   // shown, limited to render and reference
     Q_PROPERTY(qreal frameAge READ frameAge NOTIFY statsChanged)    // s since the last frame
     Q_PROPERTY(qreal bitrate READ bitrate NOTIFY statsChanged)      // Mbit/s of compressed video received
     // Traffic light: -1 none (stopped), 0 green, 1 yellow, 2 red.
@@ -155,6 +160,11 @@ public:
     static bool autoQuality();
     static void setMinFps(double fps);
     static double minFps();
+    // Smooth playback (application default) and its jitter buffer.
+    static void setSmoothDefault(bool on);
+    static bool smoothDefault();
+    static void setSmoothBufferMs(int ms);
+    static int smoothBufferMs();
     ~Player() override;
 
     static Player *fromJson(const QJsonObject &o, QObject *parent);
@@ -168,7 +178,12 @@ public:
     int transport() const { return m_transport; }
     int latency() const { return m_latency; }
     int decoder() const { return m_decoder; }
-    bool lowLatency() const { return m_lowLatency; }
+    int playMode() const { return m_playMode; }
+    enum PlayMode { PlayModeDefault = 0, PlayModeLowLatency = 1, PlayModeSmooth = 2 };
+    Q_ENUM(PlayMode)
+    bool smoothPlayback() const;
+    // Settings changed: rebuild the pipeline if it uses the application default.
+    void applyPlaybackSettings();
     int snapshotInterval() const { return m_snapshotInterval; }
     QString sourceType() const;     // human readable protocol name
     QString webUrl() const { return m_webUrl; }
@@ -225,7 +240,23 @@ public:
     qreal fps() const { return m_fps; }
     qreal inFps() const { return m_inFps; }
     qreal shownFps() const { return m_shownFps; }
-    qreal nominalFps() const { return m_nominalFps; }
+    // Frame rate declared by the stream, unless the source clearly sends
+    // more (wrong or missing value in the stream description): then 0.
+    qreal nominalFps() const
+    {
+        return (m_nominalFps > 0 && m_inFpsSlow > 1.25 * m_nominalFps + 1) ? 0 : m_nominalFps;
+    }
+    // Reference rate for "shown / reference" and the shown rate limited to
+    // it (bursts must not read as 17/16).
+    qreal refFps() const { return nominalFps() > 0 ? nominalFps() : qMax(m_inFpsSlow, m_fps); }
+    qreal displayFps() const
+    {
+        qreal v = m_shownFps;
+        if (m_renderFps >= 0)
+            v = qMin(v, m_renderFps);
+        const qreal ref = refFps();
+        return ref > 0 ? qMin(v, ref) : v;
+    }
     qreal frameAge() const { return m_frameAge; }
     qreal bitrate() const { return m_bitrate; }
     int health() const { return m_health; }
@@ -415,7 +446,7 @@ private:
     int m_transport = TransportAuto;
     int m_latency = 200;
     int m_decoder = DecoderAuto;
-    bool m_lowLatency = true;
+    int m_playMode = PlayModeDefault;
     int m_snapshotInterval = 1000;   // ms, JPEG snapshot polling
     bool m_active = true;
     qint64 m_created = 0;
@@ -451,6 +482,7 @@ private:
     quint64 m_lastBytes = 0;
     quint64 m_lastUploaded = 0;
     qreal m_nominalFps = 0;
+    qreal m_inFpsSlow = 0;     // long-term average of the received rate
     qreal m_frameAge = 0;
     qreal m_renderFps = -1;
     int m_health = HealthNone;

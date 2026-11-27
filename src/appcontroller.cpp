@@ -319,6 +319,8 @@ void AppController::load()
         Player::setAutoQuality(settings.value(QLatin1String("autoQuality")).toBool(true));
         Player::setMinFps(settings.value(QLatin1String("minTileFps")).toDouble(10));
         Player::setAudioDevice(settings.value(QLatin1String("audioDevice")).toString());
+        Player::setSmoothDefault(settings.value(QLatin1String("smoothPlayback")).toBool(true));
+        Player::setSmoothBufferMs(settings.value(QLatin1String("smoothBufferMs")).toInt(500));
         for (const QJsonValue &v : root.value(QLatin1String("windows")).toArray())
             addWindow(VmsWindow::fromJson(v.toObject(), this));
         // Automatic decisions are only valid for the environment they were
@@ -756,6 +758,40 @@ void AppController::setMinTileFps(double fps)
     settingsUpdated();
 }
 
+bool AppController::smoothPlayback() const
+{
+    return Player::smoothDefault();
+}
+
+void AppController::setSmoothPlayback(bool on)
+{
+    if (on == Player::smoothDefault())
+        return;
+    Player::setSmoothDefault(on);
+    Q_EMIT settingsChanged();
+    scheduleSave();
+    for (Player *p : allPlayers())
+        p->applyPlaybackSettings();
+}
+
+int AppController::smoothBufferMs() const
+{
+    return Player::smoothBufferMs();
+}
+
+void AppController::setSmoothBufferMs(int ms)
+{
+    if (ms == Player::smoothBufferMs())
+        return;
+    Player::setSmoothBufferMs(ms);
+    Q_EMIT settingsChanged();
+    scheduleSave();
+    if (Player::smoothDefault()) {
+        for (Player *p : allPlayers())
+            p->applyPlaybackSettings();
+    }
+}
+
 QString AppController::audioDevice() const
 {
     return Player::audioDevice();
@@ -858,7 +894,9 @@ void AppController::save()
                      {QStringLiteral("settings"), QJsonObject{{QStringLiteral("streamWaitMs"), Player::waitTimeout()},
                                                               {QStringLiteral("autoQuality"), Player::autoQuality()},
                                                               {QStringLiteral("minTileFps"), Player::minFps()},
-                                                              {QStringLiteral("audioDevice"), Player::audioDevice()}}},
+                                                              {QStringLiteral("audioDevice"), Player::audioDevice()},
+                                                              {QStringLiteral("smoothPlayback"), Player::smoothDefault()},
+                                                              {QStringLiteral("smoothBufferMs"), Player::smoothBufferMs()}}},
                      {QStringLiteral("decoderEnv"), decoderEnvironment()}};
     QDir().mkpath(QFileInfo(m_configPath).absolutePath());
     QSaveFile f(m_configPath);

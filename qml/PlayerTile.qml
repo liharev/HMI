@@ -329,7 +329,7 @@ Item {
     readonly property color healthColor: player.health === Player.HealthGood ? "#22c55e"
                                        : player.health === Player.HealthWarning ? "#eab308"
                                        : player.health === Player.HealthBad ? "#ef4444" : "#6b7280"
-    readonly property real refFps: player.nominalFps > 0 ? player.nominalFps : Math.max(player.inFps, player.fps)
+    readonly property real refFps: player.refFps
     Rectangle {
         id: healthPill
         // The status panel carries the same information when it is shown.
@@ -362,9 +362,9 @@ Item {
                 text: {
                     const p = tile.player
                     if (p.status === Player.Playing) {
-                        // What the operator really sees: limited by the window repaint rate.
-                        const r = tile.win.renderFps
-                        const shown = Math.round(r >= 0 ? Math.min(p.shownFps, r) : p.shownFps)
+                        // What the operator really sees: limited by the window repaint
+                        // rate and never above the stream's own rate.
+                        const shown = Math.round(p.displayFps)
                         return tile.refFps > 0 ? shown + "/" + Math.round(tile.refFps) + " к/с" : shown + " к/с"
                     }
                     if (p.status === Player.Connecting) return "подключение"
@@ -487,7 +487,7 @@ Item {
                     let s = (p.sourceType ? p.sourceType + " · " : "") + p.codec
                     if (p.videoWidth > 0)
                         s += "  " + p.videoWidth + "×" + p.videoHeight
-                    s += "  " + p.shownFps.toFixed(0) + " к/с"
+                    s += "  " + p.displayFps.toFixed(0) + " к/с"
                     if (p.decoderName)
                         s += "  " + (p.hardwareDecoding ? "HW " : "SW ") + p.decoderName
                     return s

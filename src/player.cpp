@@ -40,6 +40,8 @@ bool g_glRendering = false;
 int g_waitMs = 3000;
 bool g_autoQuality = true;
 double g_minFps = 10;
+bool g_smooth = true;
+int g_smoothMs = 500;
 QString g_audioDevice;
 QPointer<Player> g_audioPlayer;     // the only player with sound on
 } // namespace
@@ -54,6 +56,21 @@ int Player::waitTimeout() { return g_waitMs; }
 void Player::setAutoQuality(bool on) { g_autoQuality = on; }
 bool Player::autoQuality() { return g_autoQuality; }
 void Player::setMinFps(double fps) { g_minFps = qBound(0.0, fps, 60.0); }
+void Player::setSmoothDefault(bool on) { g_smooth = on; }
+bool Player::smoothDefault() { return g_smooth; }
+void Player::setSmoothBufferMs(int ms) { g_smoothMs = qBound(100, ms, 5000); }
+int Player::smoothBufferMs() { return g_smoothMs; }
+
+bool Player::smoothPlayback() const
+{
+    return m_playMode == PlayModeSmooth || (m_playMode == PlayModeDefault && g_smooth);
+}
+
+void Player::applyPlaybackSettings()
+{
+    if (m_playMode == PlayModeDefault && m_active && (m_ctx || m_pending))
+        rebuildSeamless(QStringLiteral("изменены настройки воспроизведения"));
+}
 double Player::minFps() { return g_minFps; }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +87,26 @@ struct PipelineCtx
     bool convert = false;          // compatibility: CPU colour conversion
     bool adaptive = false;         // HLS / DASH / MSS manifest (not a live byte stream)
     bool forceSync = false;        // segment based: frames must be paced by the clock
+    bool smooth = false;           // frames shown by their timestamps after a jitter buffer
+    // Presentation regularity (debug statistics): time between frames
+    // handed to the screen and its mean absolute deviation, in microseconds.
+    std::atomic<qint64> lastShowUs{0};
+    std::atomic<qint64> intervalUs{0};
+    std::atomic<qint64> jitterUs{0};
+    void noteShown()
+    {
+        const qint64 now = g_get_monotonic_time();
+        const qint64 last = lastShowUs.exchange(now, std::memory_order_relaxed);
+        if (!last)
+            return;
+        const qint64 d = now - last;
+        qint64 mean = intervalUs.load(std::memory_order_relaxed);
+        mean = mean ? (mean * 15 + d) / 16 : d;
+        intervalUs.store(mean, std::memory_order_relaxed);
+        const qint64 dev = d > mean ? d - mean : mean - d;
+        const qint64 j = jitterUs.load(std::memory_order_relaxed);
+        jitterUs.store(j ? (j * 15 + dev) / 16 : dev, std::memory_order_relaxed);
+    }
     QString username;
     QString password;
     GstElement *pipeline = nullptr;
@@ -442,6 +479,7 @@ struct PipelineCallbacks
         GstSample *sample = gst_app_sink_pull_sample(sink);
         if (!sample)
             return GST_FLOW_OK;
+        ctx->noteShown();      // appsink hands the frame over at its display time
         const QVideoFrame frame = sampleToFrame(sample);
         gst_sample_unref(sample);
         if (frame.isValid())
@@ -492,6 +530,17 @@ struct PipelineCallbacks
         // JPEG parser is optional, H.264/H.265 parsers are required.
         if (!append(parse, codec == gsu::Codec::Jpeg))
             return fail(QStringLiteral("Нет элемента %1 (gst-plugins-bad)").arg(parse));
+        if (ctx->smooth && append("queue", true) && !chain.isEmpty()) {
+            // Smooth playback: frames wait in the sink for their display time
+            // (pipeline latency). The jitter buffer is kept here, on the
+            // compressed stream (kilobytes per frame): decoded frames are
+            // megabytes and the decoder has few output buffers, so waiting
+            // there would stall the decoder and make the source drop data.
+            GstElement *q = chain.last();
+            gsu::setArg(q, "max-size-buffers", QStringLiteral("0"));
+            gsu::setArg(q, "max-size-bytes", QStringLiteral("0"));
+            gsu::setArg(q, "max-size-time", QString::number(qint64(qMax(2000, g_smoothMs * 3)) * 1000000));
+        }
         if (codec == gsu::Codec::Jpeg && append("queue", true) && !chain.isEmpty()) {
             // Every JPEG is a key frame: if decoding falls behind, drop old
             // compressed frames instead of accumulating delay.
@@ -899,7 +948,9 @@ Player *Player::fromJson(const QJsonObject &o, QObject *parent)
     p->m_transport = o.value(QLatin1String("transport")).toInt(TransportAuto);
     p->m_latency = o.value(QLatin1String("latency")).toInt(200);
     p->m_decoder = o.value(QLatin1String("decoder")).toInt(DecoderAuto);
-    p->m_lowLatency = o.value(QLatin1String("lowLatency")).toBool(true);
+    // "lowLatency" of older versions was the default for every player: such
+    // players follow the application setting now.
+    p->m_playMode = qBound(0, o.value(QLatin1String("playMode")).toInt(PlayModeDefault), 2);
     p->m_snapshotInterval = qBound(100, o.value(QLatin1String("snapshotInterval")).toInt(1000), 3600000);
     p->m_active = o.value(QLatin1String("active")).toBool(true);
     p->m_created = qint64(o.value(QLatin1String("created")).toDouble(double(p->m_created)));
@@ -953,7 +1004,7 @@ QJsonObject Player::toJson() const
     o.insert(QLatin1String("transport"), m_transport);
     o.insert(QLatin1String("latency"), m_latency);
     o.insert(QLatin1String("decoder"), m_decoder);
-    o.insert(QLatin1String("lowLatency"), m_lowLatency);
+    o.insert(QLatin1String("playMode"), m_playMode);
     o.insert(QLatin1String("snapshotInterval"), m_snapshotInterval);
     o.insert(QLatin1String("active"), m_active);
     o.insert(QLatin1String("created"), double(m_created));
@@ -1152,7 +1203,7 @@ QVariantMap Player::config() const
         {QStringLiteral("transport"), m_transport},
         {QStringLiteral("latency"), m_latency},
         {QStringLiteral("decoder"), m_decoder},
-        {QStringLiteral("lowLatency"), m_lowLatency},
+        {QStringLiteral("playMode"), m_playMode},
         {QStringLiteral("snapshotInterval"), m_snapshotInterval},
         {QStringLiteral("webUrl"), m_webUrl},
         {QStringLiteral("output"), m_output},
@@ -1175,7 +1226,7 @@ void Player::applyConfig(const QVariantMap &c)
     const int transport = c.value(QStringLiteral("transport"), m_transport).toInt();
     const int latency = qBound(0, c.value(QStringLiteral("latency"), m_latency).toInt(), 10000);
     const int decoder = c.value(QStringLiteral("decoder"), m_decoder).toInt();
-    const bool lowLatency = c.value(QStringLiteral("lowLatency"), m_lowLatency).toBool();
+    const int playMode = qBound(0, c.value(QStringLiteral("playMode"), m_playMode).toInt(), 2);
     m_snapshotInterval = qBound(100, c.value(QStringLiteral("snapshotInterval"), m_snapshotInterval).toInt(), 3600000);
     // Output path: changing it rebuilds the pipeline (and maybe the surface).
     const int output = qBound(0, c.value(QStringLiteral("output"), m_output).toInt(), 3);
@@ -1231,7 +1282,7 @@ void Player::applyConfig(const QVariantMap &c)
                               || camaiHost != m_camaiRtspHost || user != m_username || pass != m_password;
     const bool otherStreamChanged = user != m_username || pass != m_password
                                     || transport != m_transport || latency != m_latency
-                                    || decoder != m_decoder || lowLatency != m_lowLatency;
+                                    || decoder != m_decoder || playMode != m_playMode;
     m_name = c.value(QStringLiteral("name"), m_name).toString().trimmed();
     if (m_name.isEmpty())
         m_name = QUrl(url).host().isEmpty() ? url : QUrl(url).host();
@@ -1245,7 +1296,7 @@ void Player::applyConfig(const QVariantMap &c)
     if (decoder != m_decoder)
         m_balancedSw = false;
     m_decoder = decoder;
-    m_lowLatency = lowLatency;
+    m_playMode = playMode;
     if (camaiChanged) {
         m_camaiService = camaiService;
         m_camaiChannel = camaiChannel;
@@ -1487,13 +1538,18 @@ GstElement *Player::buildTail(PipelineCtx *ctx, QString *error)
         // almost the whole segment (seen as ~0.5 fps): block the decoder
         // instead (back-pressure), the demuxer buffers the rest.
         gsu::setArg(queue, "max-size-buffers", QStringLiteral("4"));
+    } else if (ctx->smooth) {
+        // Smooth: frames wait in the sink for their display time; the queue
+        // must not throw them away meanwhile (that is what made motion
+        // irregular), the jitter is absorbed by the pipeline latency.
+        gsu::setArg(queue, "max-size-buffers", QStringLiteral("3"));
     } else {
-        // Live sources: keep at most 2 decoded frames, drop old ones instead
-        // of accumulating latency.
+        // Minimum latency: keep at most 2 decoded frames, drop old ones
+        // instead of accumulating latency.
         gsu::setArg(queue, "max-size-buffers", QStringLiteral("2"));
         gsu::setArg(queue, "leaky", QStringLiteral("downstream"));
     }
-    const QString sync = (m_lowLatency && !ctx->forceSync) ? QStringLiteral("false") : QStringLiteral("true");
+    const QString sync = (ctx->smooth || ctx->forceSync) ? QStringLiteral("true") : QStringLiteral("false");
 
     QList<GstElement *> elems{queue};
     if (qEnvironmentVariableIsSet("HMI_TEST_SLOW_UPLOAD")) {
@@ -1693,6 +1749,14 @@ PipelineCtx *Player::buildPipeline(const QString &urlText, bool pending, QString
         // segment would be shown in a burst followed by a freeze.
         ctx->forceSync = ctx->adaptive;
         ctx->liveHttp = !ctx->adaptive;
+    }
+    // Snapshots (one JPEG per interval) are shown when they arrive.
+    ctx->smooth = smoothPlayback() && kind != Source::Snapshot && !ctx->forceSync;
+    if (ctx->smooth) {
+        // Frames are displayed this long after capture: network and decoder
+        // irregularities within it do not reach the screen.
+        const int ms = qMax(g_smoothMs, kind == Source::Rtsp ? m_latency + 100 : 0);
+        gst_pipeline_set_latency(GST_PIPELINE(pipe), GstClockTime(ms) * GST_MSECOND);
     }
 
     QString err;
@@ -2215,6 +2279,7 @@ void Player::resetStats()
     m_slowOutTicks = 0;
     m_statsUs = 0;
     m_qtShown = 0;
+    m_inFpsSlow = 0;
 }
 
 void Player::teardown(bool synchronous)
@@ -2396,6 +2461,7 @@ void Player::onWatchdog()
     m_fps = ema(m_fps, delta);
     const quint64 in = m_ctx->hasDecoderProbe ? m_ctx->inFrames.load(std::memory_order_relaxed) : frames;
     m_inFps = ema(m_inFps, in - m_lastIn);
+    m_inFpsSlow = m_inFpsSlow <= 0 ? m_inFps : m_inFpsSlow * 0.9 + m_inFps * 0.1;
     m_lastIn = in;
     const quint64 shown = m_ctx->glSink ? m_ctx->shown.load(std::memory_order_relaxed)
                                         : m_qtShown.load(std::memory_order_relaxed);
@@ -2413,8 +2479,9 @@ void Player::onWatchdog()
     updateHealth();
     static const bool debugStats = qEnvironmentVariableIntValue("HMI_DEBUG_STATS") > 0;
     if (debugStats)
-        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f path %s decoder %s audio %s/%llu | %s",
+        qInfo("[%s] in %.1f dec %.1f upload %.1f shown %.1f render %.1f nominal %.1f age %.2f interval %.1f jitter %.1f ms %s path %s decoder %s audio %s/%llu | %s",
               qPrintable(m_name), m_inFps, m_fps, m_uploadFps, m_shownFps, m_renderFps, m_nominalFps, m_frameAge,
+              m_ctx->intervalUs.load() / 1000.0, m_ctx->jitterUs.load() / 1000.0, m_ctx->smooth ? "smooth" : "low-latency",
               qPrintable(renderPath()), qPrintable(m_decoderName), m_audioOn ? "on" : "off",
               (unsigned long long)m_ctx->audioBuffers.load(std::memory_order_relaxed),
               qPrintable(QString(m_healthText).replace(QLatin1Char('\n'), QLatin1String(" / "))));
@@ -2468,13 +2535,13 @@ void Player::setBalancedSoftware(bool sw)
 
 qreal Player::pixelRate() const
 {
-    const qreal rate = m_nominalFps > 0 ? m_nominalFps : 0;
+    const qreal rate = nominalFps() > 0 ? nominalFps() : 0;
     return qreal(m_videoWidth) * m_videoHeight * rate;
 }
 
 bool Player::decoderLagging() const
 {
-    return m_status == Playing && m_nominalFps > 0 && m_fps < 0.85 * m_nominalFps;
+    return m_status == Playing && nominalFps() > 0 && m_fps < 0.85 * nominalFps();
 }
 
 QString Player::renderPath() const
@@ -2561,7 +2628,7 @@ void Player::updateHealth()
         break;
     case Playing: {
         // Reference rate: what the stream declares, otherwise what arrives.
-        const qreal ref = m_nominalFps > 0 ? m_nominalFps : qMax(m_inFps, m_fps);
+        const qreal ref = nominalFps() > 0 ? nominalFps() : qMax(m_inFps, m_fps);
         qreal shown = m_shownFps;
         if (m_renderFps >= 0 && m_renderFps < shown)
             shown = m_renderFps;      // the window repaints less often than frames arrive
@@ -2577,7 +2644,7 @@ void Player::updateHealth()
             t = QStringLiteral("Нет новых кадров %1 с").arg(f1(m_frameAge));
         } else if (ref >= 2 && shown < 0.8 * ref) {
             // Which stage loses the frames: source/network -> decoder -> display.
-            const qreal lossSource = m_nominalFps > 0 ? qMax<qreal>(0, 1 - m_inFps / m_nominalFps) : 0;
+            const qreal lossSource = nominalFps() > 0 ? qMax<qreal>(0, 1 - m_inFps / nominalFps()) : 0;
             const qreal lossDecoder = m_inFps > 0.5 ? qMax<qreal>(0, 1 - m_fps / m_inFps) : 0;
             const qreal lossDisplay = m_fps > 0.5 ? qMax<qreal>(0, 1 - shown / m_fps) : 0;
             h = shown < 0.3 * ref ? HealthBad : HealthWarning;
@@ -2589,9 +2656,9 @@ void Player::updateHealth()
                 t = (h == HealthBad ? QStringLiteral("Отображение не успевает: %1 из %2 к/с (перегружен GPU/вывод)")
                                     : QStringLiteral("Отображение пропускает кадры: %1 из %2 к/с"))
                         .arg(f1(shown), f1(m_fps));
-        } else if (m_nominalFps > 0 && m_inFps < 0.6 * m_nominalFps) {
+        } else if (nominalFps() > 0 && m_inFps < 0.6 * nominalFps()) {
             h = HealthWarning;
-            t = QStringLiteral("Источник присылает мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(m_nominalFps));
+            t = QStringLiteral("Источник присылает мало кадров: %1 из %2 к/с").arg(f1(m_inFps), f1(nominalFps()));
         } else if (m_frameAge >= yellowAge) {
             h = HealthWarning;
             t = QStringLiteral("Перебои: кадра не было %1 с").arg(f1(m_frameAge));
@@ -3178,8 +3245,8 @@ void Player::learnProfile()
         sp.height = m_videoHeight;
         changed = true;
     }
-    if (m_nominalFps > 0 && qAbs(sp.fps - m_nominalFps) > 0.5) {
-        sp.fps = qRound(m_nominalFps * 100) / 100.0;
+    if (nominalFps() > 0 && qAbs(sp.fps - nominalFps()) > 0.5) {
+        sp.fps = qRound(nominalFps() * 100) / 100.0;
         changed = true;
     }
     QString codec = m_codec == QLatin1String("H.264") ? QStringLiteral("h264")

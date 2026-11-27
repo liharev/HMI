@@ -45,6 +45,9 @@ class AppController : public QObject
     // lowest frame rate the choice may go to.
     Q_PROPERTY(bool autoQuality READ autoQuality WRITE setAutoQuality NOTIFY settingsChanged)
     Q_PROPERTY(double minTileFps READ minTileFps WRITE setMinTileFps NOTIFY settingsChanged)
+    // Smooth playback: frames shown by their timestamps after a jitter buffer.
+    Q_PROPERTY(bool smoothPlayback READ smoothPlayback WRITE setSmoothPlayback NOTIFY settingsChanged)
+    Q_PROPERTY(int smoothBufferMs READ smoothBufferMs WRITE setSmoothBufferMs NOTIFY settingsChanged)
     // Output device for the sound ("" = system default) and the devices found.
     Q_PROPERTY(QString audioDevice READ audioDevice WRITE setAudioDevice NOTIFY settingsChanged)
     Q_PROPERTY(QStringList audioDevices READ audioDevices NOTIFY audioDevicesChanged)
@@ -72,6 +75,10 @@ public:
     void setAutoQuality(bool on);
     double minTileFps() const;
     void setMinTileFps(double fps);
+    bool smoothPlayback() const;
+    void setSmoothPlayback(bool on);
+    int smoothBufferMs() const;
+    void setSmoothBufferMs(int ms);
     QString audioDevice() const;
     void setAudioDevice(const QString &name);
     QStringList audioDevices() const { return m_audioDevices; }

@@ -47,7 +47,7 @@ Dialog {
         transportBox.currentIndex = c.transport !== undefined ? c.transport : 0
         latencySpin.value = c.latency !== undefined ? c.latency : 200
         decoderBox.currentIndex = c.decoder !== undefined ? c.decoder : 0
-        lowLatencyCheck.checked = c.lowLatency !== undefined ? c.lowLatency : true
+        playModeBox.currentIndex = c.playMode !== undefined ? c.playMode : 0
         snapshotSpin.value = c.snapshotInterval !== undefined ? c.snapshotInterval : 1000
         webField.text = c.webUrl || ""
         rotationBox.currentIndex = c.rotation !== undefined ? c.rotation / 90 : 0
@@ -159,7 +159,7 @@ Dialog {
             transport: transportBox.currentIndex,
             latency: latencySpin.value,
             decoder: decoderBox.currentIndex,
-            lowLatency: lowLatencyCheck.checked,
+            playMode: playModeBox.currentIndex,
             snapshotInterval: snapshotSpin.value,
             webUrl: webField.text.trim(),
             rotation: rotationBox.currentIndex * 90,
@@ -509,17 +509,19 @@ Dialog {
                 model: ["Авто (аппаратный, при ошибке — программный)", "Только аппаратный (VPU)", "Только программный (CPU)"]
             }
 
-            Item { implicitWidth: 1; implicitHeight: 1 }
-            RowLayout {
+            Label { text: "Воспроизведение" }
+            ComboBox {
+                id: playModeBox
                 Layout.fillWidth: true
                 Layout.preferredWidth: dlg.em * 4
-                CheckBox { id: lowLatencyCheck }
-                Label {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    text: "Минимальная задержка (выводить кадры сразу, без синхронизации по времени)"
-                    MouseArea { anchors.fill: parent; onClicked: lowLatencyCheck.toggle() }
-                }
+                model: ["Как в настройках программы (" + (App.smoothPlayback ? "плавно" : "минимальная задержка") + ")",
+                         "Минимальная задержка", "Плавно"]
+            }
+            Item { implicitWidth: 1; implicitHeight: 1 }
+            Hint {
+                text: "Плавно — кадры показываются по их времени после буфера (" + App.smoothBufferMs
+                      + " мс), движение равномерное. Минимальная задержка — кадр выводится сразу после "
+                      + "декодирования; при неравномерной доставке по сети движение рывками."
             }
 
             Label { text: "Вывод видео" }
