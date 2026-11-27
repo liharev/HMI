@@ -1,6 +1,6 @@
 diff -ru orig/drm_gpuvm.c new/drm_gpuvm.c
 --- a/drm_gpuvm.c	2026-11-27 10:13:09.286926367 +0000
-+++ b/drm_gpuvm.c	2026-11-27 10:13:09.342702622 +0000
++++ b/drm_gpuvm.c	2026-11-27 10:45:04.325560865 +0000
 @@ -1147,6 +1147,13 @@
  
  	drm_gpuvm_resv_assert_held(gpuvm);
@@ -15,19 +15,27 @@ diff -ru orig/drm_gpuvm.c new/drm_gpuvm.c
  		ret = exec_prepare_obj(exec, vm_bo->obj, num_fences);
  		if (ret)
  			break;
-@@ -1507,6 +1514,11 @@
+@@ -1507,6 +1514,19 @@
  
  	if (!lock)
  		drm_gpuvm_resv_assert_held(gpuvm);
 +	/* HMI debug: the lists are protected by the VM resv (no lockdep here). */
 +	if (!lock && !dma_resv_is_locked(drm_gpuvm_resv(gpuvm))) {
-+		pr_err("panthor-debug: vm_bo %p destroyed without the VM resv held (%s)\n", vm_bo, gpuvm->name);
-+		dump_stack();
++		static atomic_t hmi_reports = ATOMIC_INIT(0);
++		struct dma_resv *r = drm_gpuvm_resv(gpuvm);
++
++		if (atomic_inc_return(&hmi_reports) <= 5) {
++			pr_err("panthor-debug: vm_bo %p destroyed without the VM resv held (%s): gpuvm %px r_obj %px resv %px owner %lx current %px sizeof(gem) %zu off(resv) %zu\n",
++			       vm_bo, gpuvm->name, gpuvm, gpuvm->r_obj, r,
++			       (unsigned long)atomic_long_read(&r->lock.base.owner), current,
++			       sizeof(struct drm_gem_object), offsetof(struct drm_gem_object, resv));
++			dump_stack();
++		}
 +	}
  
  	drm_gpuvm_bo_list_del(vm_bo, extobj, lock);
  	drm_gpuvm_bo_list_del(vm_bo, evict, lock);
-@@ -1675,6 +1687,10 @@
+@@ -1675,6 +1695,10 @@
  
  	if (!lock)
  		drm_gpuvm_resv_assert_held(gpuvm);
@@ -38,27 +46,27 @@ diff -ru orig/drm_gpuvm.c new/drm_gpuvm.c
  
  	if (drm_gpuvm_is_extobj(gpuvm, vm_bo->obj))
  		drm_gpuvm_bo_list_add(vm_bo, extobj, lock);
-@@ -2748,5 +2764,6 @@
+@@ -2748,5 +2772,6 @@
  }
  EXPORT_SYMBOL_GPL(drm_gpuva_ops_free);
  
-+MODULE_INFO(hmi_debug, "1");
++MODULE_INFO(hmi_debug, "2");
  MODULE_DESCRIPTION("DRM GPUVM");
  MODULE_LICENSE("GPL");
 diff -ru orig/panthor/panthor_drv.c new/panthor/panthor_drv.c
 --- a/panthor/panthor_drv.c	2026-11-27 10:13:09.285334296 +0000
-+++ b/panthor/panthor_drv.c	2026-11-27 10:13:09.342358271 +0000
++++ b/panthor/panthor_drv.c	2026-11-27 10:45:04.324966212 +0000
 @@ -1723,6 +1723,7 @@
  }
  module_exit(panthor_exit);
  
-+MODULE_INFO(hmi_debug, "1");
++MODULE_INFO(hmi_debug, "2");
  MODULE_AUTHOR("Panthor Project Developers");
  MODULE_DESCRIPTION("Panthor DRM Driver");
  MODULE_LICENSE("Dual MIT/GPL");
 diff -ru orig/panthor/panthor_gem.c new/panthor/panthor_gem.c
 --- a/panthor/panthor_gem.c	2026-11-27 10:13:09.285304294 +0000
-+++ b/panthor/panthor_gem.c	2026-11-27 10:13:09.342069871 +0000
++++ b/panthor/panthor_gem.c	2026-11-27 10:45:04.324689884 +0000
 @@ -63,6 +63,16 @@
  	struct panthor_gem_object *bo = to_panthor_bo(obj);
  	struct drm_gem_object *vm_root_gem = bo->exclusive_vm_root_gem;
@@ -76,3 +84,24 @@ diff -ru orig/panthor/panthor_gem.c new/panthor/panthor_gem.c
  	panthor_gem_debugfs_bo_rm(bo);
  
  	/*
+diff -ru orig/panthor/panthor_mmu.c new/panthor/panthor_mmu.c
+--- a/panthor/panthor_mmu.c	2026-11-27 10:45:04.289796068 +0000
++++ b/panthor/panthor_mmu.c	2026-11-27 10:45:04.325197164 +0000
+@@ -1073,6 +1073,17 @@
+ 	 * GEM vm_bo list.
+ 	 */
+ 	dma_resv_lock(drm_gpuvm_resv(vm), NULL);
++	/* HMI debug: what exactly is locked here. */
++	{
++		static atomic_t hmi_reports = ATOMIC_INIT(0);
++		struct dma_resv *r = drm_gpuvm_resv(vm);
++
++		if (atomic_inc_return(&hmi_reports) <= 5)
++			pr_err("panthor-debug: bo_put vm %px vm_bo->vm %px r_obj %px resv %px locked %d owner %lx current %px sizeof(gem) %zu off(resv) %zu\n",
++			       vm, vm_bo->vm, vm->r_obj, r, dma_resv_is_locked(r),
++			       (unsigned long)atomic_long_read(&r->lock.base.owner), current,
++			       sizeof(struct drm_gem_object), offsetof(struct drm_gem_object, resv));
++	}
+ 	mutex_lock(&bo->gpuva_list_lock);
+ 	unpin = drm_gpuvm_bo_put(vm_bo);
+ 	mutex_unlock(&bo->gpuva_list_lock);

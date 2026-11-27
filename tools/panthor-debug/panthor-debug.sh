@@ -56,7 +56,8 @@ KB
 
 cmd_build() {
   [ -d "/lib/modules/$KREL/build" ] || die "нет заголовков ядра: sudo apt install linux-headers-vendor-rk35xx"
-  [ -f "$WORK/src/Kbuild" ] || cmd_fetch
+  # Always start from fresh sources: the debug patch changes between rounds.
+  cmd_fetch
   say "Сборка модулей для $KREL"
   # The kernel was built with GCC 14: use the same major version if present
   # (sudo apt install gcc-14), otherwise the default compiler.
@@ -93,7 +94,7 @@ cmd_uninstall() {
 cmd_status() {
   for m in panthor drm_gpuvm drm_exec; do
     printf '%-10s %s  %s\n' "$m" "$(modinfo -n $m 2>/dev/null)" \
-      "$(modinfo -F hmi_debug $m 2>/dev/null | grep -q 1 && echo '[отладочный]' || echo '')"
+      "$(v=$(modinfo -F hmi_debug $m 2>/dev/null); [ -n "$v" ] && echo "[отладочный, версия $v]")"
   done
   [ -e /sys/module/panthor ] && echo "panthor загружен" || echo "panthor НЕ загружен"
 }
